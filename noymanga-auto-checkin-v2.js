@@ -1,23 +1,28 @@
 #!/usr/bin/env node
 /*
- * Noymanga 自动签到 —— v2「默认浏览器版」
+ * Noymanga 自动签到 —— v3「一键版」
  * ============================================================
- * 与 v1 的区别：
- *   1. 不再硬编码 Chrome，而是读取 Windows 注册表找出系统默认浏览器，
- *      用它的可执行文件启动（Edge / Chrome / Brave / Vivaldi / Opera 均支持）。
- *   2. 默认浏览器不是 Chromium 内核（如 Firefox）时，自动回落到已安装的 Chromium 浏览器。
- *   3. 签到请求失败自动重试（指数退避），浏览器启动失败自动换下一个候选。
- *   4. 每次运行结果写入 status.txt，日志自动保留 30 天。
- *   5. 增加 --dry-run：只检测浏览器和环境，不启动任何窗口、不签到。
+ * 与 v2 的区别：
+ *   1. 默认无窗口运行（headless）：午夜不再弹出浏览器窗口。
+ *   2. 需要登录时自动换成有窗口模式，把登录页摆到你面前，并给你 2 分钟。
+ *   3. 登录超时会自动关掉窗口、发 Windows 通知、退出——不再留下僵尸窗口。
+ *   4. 结果用 Windows 通知提示：签到成功 / 失败 / 需要重新登录。
+ *   5. 支持 config.json 覆盖默认参数，不懂代码也能改。
+ *   6. 新增 --login（只登录）、--notify-test（测试通知）、--headless/--headed。
  *
  * 不变的设计契约：
  *   - 源码里没有任何账号密码，登录态只存在于 profile 目录（默认 browser-profile/）。
- *   - 首次运行会打开浏览器窗口，请在里面正常登录 Noymanga，然后关闭窗口。
- *     登录信息被写入 profile 目录，之后每天的计划任务就全自动了。
+ *   - 首次运行需要你手动登录一次，之后每天全自动。
  *
  * 用法：
- *   node noymanga-auto-checkin-v2.js             # 正常签到
- *   node noymanga-auto-checkin-v2.js --dry-run   # 只体检，不启动浏览器
+ *   node noymanga-auto-checkin-v2.js                 # 正常签到（无窗口）
+ *   node noymanga-auto-checkin-v2.js --login         # 只打开登录页，登录后退出
+ *   node noymanga-auto-checkin-v2.js --dry-run       # 只体检，不启动浏览器
+ *   node noymanga-auto-checkin-v2.js --headless      # 强制无窗口
+ *   node noymanga-auto-checkin-v2.js --headed        # 强制有窗口（排错用）
+ *   node noymanga-auto-checkin-v2.js --notify-test   # 弹一条测试通知
+ *
+ * 退出码：0 成功（含"今天已经签过"），2 需要登录，1 其它失败。
  *
  * 运行要求：Node.js 22 或更高版本（脚本用了全局 WebSocket）。
  */
@@ -30,13 +35,20 @@ const path = require("path");
 const { spawn, execFileSync } = require("child_process");
 
 /* ============================================================
- * 一、可调参数
+ * 一、参数与配置
  * ============================================================ */
-const CONFIG = {
+const ROOT = __dirname;
+
+/** 代码里的默认值；config.json 里同名键会覆盖它们。 */
+const DEFAULT_CONFIG = {
   url: "https://noymanga.com/user",          // 签到页面
+  loginUrl: "https://noymanga.com/login",    // 登录页面（需要登录时打开）
   signinPath: "/api/v4/signin/sign",         // 签到接口（同源 POST，无请求体）
   debugPort: 19346,                          // 调试端口，刻意避开默认的 9222
   profileDirName: "browser-profile",         // 专用浏览器配置目录（登录态存这里）
+  headless: true,                            // 无窗口运行；需要登录时自动改用有窗口
+  notify: true,                              // 是否弹 Windows 通知
+  loginTimeoutSeconds: 120,                  // 需要登录时，给你多久时间登录
   startTimeoutMs: 35_000,                    // 等待浏览器开放调试端口的上限
   pollIntervalMs: 500,                       // 轮询间隔
   pageReadyMs: 2_000,                        // 等前端框架渲染（水合）的固定等待
@@ -47,12 +59,38 @@ const CONFIG = {
   logRetentionDays: 30,                      // 日志保留天数
 };
 
-const DRY_RUN = process.argv.includes("--dry-run");
+const CONFIG_FILE = path.join(ROOT, "config.json");
 
-const ROOT = __dirname;
+/** 读 config.json（如果存在），把同名键覆盖到默认值上。 */
+function loadConfig() {
+  const config = { ...DEFAULT_CONFIG };
+  if (!fs.existsSync(CONFIG_FILE)) return config;
+  try {
+    const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+    for (const key of Object.keys(DEFAULT_CONFIG)) {
+      if (raw[key] !== undefined && raw[key] !== null) config[key] = raw[key];
+    }
+  } catch (error) {
+    console.log(`[WARN] config.json is not valid JSON; using defaults. (${error.message})`);
+  }
+  return config;
+}
+
+const CONFIG = loadConfig();
+
 const PROFILE_DIR = path.join(ROOT, CONFIG.profileDirName);
 const LOG_DIR = path.join(ROOT, "logs");
 const STATUS_FILE = path.join(ROOT, "status.txt");
+
+const ARGS = new Set(process.argv.slice(2));
+const DRY_RUN = ARGS.has("--dry-run");
+const LOGIN_ONLY = ARGS.has("--login");
+const NOTIFY_TEST = ARGS.has("--notify-test");
+// 命令行显式指定的模式优先于 config.json
+const FORCE_HEADLESS = ARGS.has("--headless");
+const FORCE_HEADED = ARGS.has("--headed");
+
+const LOGIN_TIMEOUT_MS = Math.max(15, Number(CONFIG.loginTimeoutSeconds) || 120) * 1000;
 
 /* ============================================================
  * 二、日志与状态
@@ -83,7 +121,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 把本次运行结果写到 status.txt，方便一眼看最近一次的成败。 */
+/** 把本次运行结果写到 status.txt，方便一键查看最近一次的成败。 */
 function writeStatus(state, message, extra = {}) {
   const payload = {
     time: new Date().toISOString(),
@@ -123,7 +161,78 @@ function cleanupOldLogs() {
 }
 
 /* ============================================================
- * 三、识别系统默认浏览器
+ * 三、Windows 通知
+ * ------------------------------------------------------------
+ * 不依赖任何第三方模块：直接调 WinRT 的 Toast API。
+ * 中文内容通过 -EncodedCommand（UTF-16LE + base64）传给 PowerShell，
+ * 彻底绕开控制台代码页问题。
+ * ============================================================ */
+const POWERSHELL_APP_ID =
+  "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+function escapeXml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** 构造一段弹 Toast 的 PowerShell 脚本。 */
+function toastScript(title, message, seconds = 8) {
+  return `
+$ErrorActionPreference = 'SilentlyContinue'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] > $null
+$xml = @'
+<toast><visual><binding template="ToastGeneric"><text>${escapeXml(title)}</text><text>${escapeXml(message)}</text></binding></visual></toast>
+'@
+$doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+$doc.LoadXml($xml)
+$toast = New-Object Windows.UI.Notifications.ToastNotification $doc
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${POWERSHELL_APP_ID}')
+$notifier.Show($toast)
+Start-Sleep -Seconds ${Math.max(1, Math.round(seconds))}
+`.trim();
+}
+
+/** 用 PowerShell 的 -EncodedCommand 执行一段脚本，返回是否成功。 */
+function runPowerShell(script, timeoutMs = 15_000) {
+  if (process.platform !== "win32") return false;
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      { stdio: "ignore", windowsHide: true, timeout: timeoutMs },
+    );
+    return true;
+  } catch (error) {
+    log(`PowerShell helper failed: ${error.message}`, "WARN");
+    return false;
+  }
+}
+
+/** 弹一条 Windows 通知；失败只记日志，不影响签到。 */
+function notify(title, message) {
+  if (!CONFIG.notify || DRY_RUN) return;
+  // 不等待：通知是"尽力而为"，不能拖慢或拖垮签到
+  const script = toastScript(title, message, 8);
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      { stdio: "ignore", windowsHide: true, detached: true },
+    );
+    child.unref();
+  } catch (error) {
+    log(`Notification skipped: ${error.message}`, "WARN");
+  }
+}
+
+/* ============================================================
+ * 四、识别系统默认浏览器
  * ------------------------------------------------------------
  * 思路：Windows 把「.html/https 的默认程序」记在注册表的 UserChoice 键里，
  * 值是 ProgId（如 MSEdgeHTM / ChromeHTML）。再用 ProgId 去 HKCR 查出
@@ -283,11 +392,17 @@ function resolveBrowsers() {
     return true;
   });
 
+  // 排错用：环境变量 NOYMANG_BROWSER 可以强制指定浏览器（绝对路径）
+  const override = process.env.NOYMANG_BROWSER;
+  if (override && fs.existsSync(override)) {
+    browsers.unshift({ name: `Override (${path.basename(override)})`, exe: override });
+  }
+
   return { browsers, notes };
 }
 
 /* ============================================================
- * 四、与浏览器通信的基础件（CDP）
+ * 五、与浏览器通信的基础件（CDP）
  * ============================================================ */
 
 /** 向浏览器调试端口发 HTTP GET 并解析 JSON。 */
@@ -335,6 +450,16 @@ async function waitForTarget(timeoutMs) {
     await delay(CONFIG.pollIntervalMs);
   }
   return null;
+}
+
+/** 等调试端口彻底关闭（浏览器进程真的退出了）。 */
+async function waitForPortClosed(timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await probeTarget())) return true;
+    await delay(300);
+  }
+  return false;
 }
 
 /** 一个最小可用的 CDP 客户端：用 id 把「请求」和「响应」配对。 */
@@ -398,18 +523,97 @@ async function closeBrowser(cdp) {
 }
 
 /* ============================================================
- * 五、页面判断与签到
+ * 六、启动 / 关闭浏览器
+ * ============================================================ */
+
+/** 按优先级依次尝试启动浏览器；成功返回 { target, browser }，全失败返回 null。 */
+async function launchBrowser(headless, startUrl) {
+  const { browsers } = resolveBrowsers();
+  for (const browser of browsers) {
+    log(`Launching ${browser.name}${headless ? " (headless)" : ""}: ${browser.exe}`);
+    const args = [
+      `--remote-debugging-port=${CONFIG.debugPort}`,
+      `--user-data-dir=${PROFILE_DIR}`,
+      "--remote-allow-origins=*",
+      "--no-first-run",
+      "--no-default-browser-check",
+    ];
+    if (headless) args.push("--headless=new", "--hide-scrollbars", "--mute-audio");
+    args.push(startUrl);
+
+    let child;
+    try {
+      child = spawn(browser.exe, args, { detached: false, stdio: "ignore" });
+      child.unref();
+    } catch (error) {
+      log(`Failed to spawn ${browser.name}: ${error.message}`, "WARN");
+      continue;
+    }
+
+    const target = await waitForTarget(CONFIG.startTimeoutMs);
+    if (target) return { target, browser };
+    log(`${browser.name} did not open the debug port in time; trying the next one.`, "WARN");
+    try {
+      child.kill();
+    } catch (_) {
+      /* 忽略 */
+    }
+    await delay(1_000);
+  }
+  return null;
+}
+
+/**
+ * 打开浏览器 → 连上 → 执行 fn(cdp) → 关掉浏览器。
+ * headless 启动失败时自动回退到有窗口模式（有些机器/杀软会拦 headless）。
+ */
+async function withBrowser(headless, startUrl, fn) {
+  // 上一次运行残留的会话直接复用，避免重复启动
+  let target = await probeTarget();
+  let usedHeadless = headless;
+  if (target) {
+    log("An existing browser debug session is still open; reusing it.");
+  } else {
+    let launched = await launchBrowser(headless, startUrl);
+    if (!launched && headless) {
+      log("Headless launch failed; retrying with a visible window.", "WARN");
+      await waitForPortClosed(5_000);
+      launched = await launchBrowser(false, startUrl);
+      usedHeadless = false;
+    }
+    if (!launched) {
+      fail("None of the browsers opened a debug port in time. Close leftover browser windows and retry.");
+    }
+    target = launched.target;
+  }
+
+  const cdp = connectCdp(target.webSocketDebuggerUrl);
+  await cdp.opened;
+  await cdp.send("Page.enable");
+  await cdp.send("Runtime.enable");
+
+  try {
+    return await fn(cdp, usedHeadless);
+  } finally {
+    await closeBrowser(cdp);
+    cdp.close();
+    await waitForPortClosed(10_000);
+  }
+}
+
+/* ============================================================
+ * 七、页面判断与签到
  * ============================================================ */
 
 /**
  * 在页面里轮询，直到能判断出当前状态。
  * 返回 { actionable, already, login, title, url }。
  */
-async function readPageState(cdp) {
+async function readPageState(cdp, waitMs = CONFIG.inPageWaitMs) {
   return evaluate(
     cdp,
     `(async () => {
-      const until = Date.now() + ${CONFIG.inPageWaitMs};
+      const until = Date.now() + ${waitMs};
       while (Date.now() < until) {
         const text = document.body?.innerText || '';
         const checkinLabel = /^(?:每日)?[签簽]\\s*到|立即[签簽]\\s*到$/u;
@@ -447,6 +651,25 @@ async function readPageState(cdp) {
       return { actionable: false, already: false, login: false, title: document.title, url: location.href };
     })()`,
   );
+}
+
+/** 轻量读取页面身份：只要 url 和"是否还显示登录入口"，用于登录轮询。 */
+async function readQuickState(cdp) {
+  try {
+    return await evaluate(
+      cdp,
+      `(() => {
+        const text = document.body?.innerText || '';
+        return {
+          url: location.href,
+          login: /登录|登入/u.test(text) && !/退出登录|登出/u.test(text),
+          title: document.title,
+        };
+      })()`,
+    );
+  } catch (_) {
+    return null; // 页面正在跳转时可能报错，忽略
+  }
 }
 
 /** 在已登录页面里调用签到接口（浏览器会自动带上 Cookie）。 */
@@ -492,10 +715,134 @@ async function requestCheckinWithRetry(cdp) {
 }
 
 /* ============================================================
- * 六、主流程
+ * 八、登录流程
+ * ------------------------------------------------------------
+ * 需要登录 → 关掉无窗口实例 → 弹出有窗口的登录页 → 最多等 2 分钟：
+ *   · 登录成功：继续签到
+ *   · 超时：关掉窗口、发通知、退出（不留僵尸窗口）
  * ============================================================ */
+async function loginFlow() {
+  // 1) 先确保没有同 profile 的实例占着（Chrome 的 profile 是独占的）
+  const existing = await probeTarget();
+  if (existing) {
+    try {
+      const cdp = connectCdp(existing.webSocketDebuggerUrl);
+      await cdp.opened;
+      await closeBrowser(cdp);
+      cdp.close();
+    } catch (_) {
+      /* 忽略 */
+    }
+  }
+  await waitForPortClosed(10_000);
+
+  // 2) 有窗口启动，直接落在登录页
+  const launched = await launchBrowser(false, CONFIG.loginUrl);
+  if (!launched) fail("Could not launch a browser window for login.");
+
+  const cdp = connectCdp(launched.target.webSocketDebuggerUrl);
+  await cdp.opened;
+  try {
+    await cdp.send("Page.enable");
+    await cdp.send("Runtime.enable");
+    try {
+      await cdp.send("Page.navigate", { url: CONFIG.loginUrl });
+    } catch (_) {
+      /* 已经在登录页也无所谓 */
+    }
+    await delay(1_500);
+
+    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+    let closedByUser = false;
+    while (Date.now() < deadline) {
+      const quick = await readQuickState(cdp);
+      if (!quick) {
+        // 读不到页面：可能是你手动关掉了窗口
+        if (!(await probeTarget())) {
+          closedByUser = true;
+          break;
+        }
+        await delay(1_000);
+        continue;
+      }
+      if (!quick.login && /noymanga\.com\/user/.test(quick.url)) {
+        log("Login detected; continuing.");
+        await delay(1_000);
+        return true;
+      }
+      await delay(2_000);
+    }
+    if (closedByUser) log("The login window was closed before login completed.", "WARN");
+    else log(`Login timed out after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s.`, "WARN");
+    return false;
+  } finally {
+    // 无论成功失败都关掉，绝不留僵尸窗口
+    await closeBrowser(cdp);
+    cdp.close();
+    await waitForPortClosed(10_000);
+  }
+}
+
+/* ============================================================
+ * 九、主流程
+ * ============================================================ */
+
+/** 判断页面的三种结局：已签到 / 可签到 / 需要登录。 */
+async function inspectPage(cdp) {
+  await cdp.send("Page.navigate", { url: CONFIG.url });
+  // 页面是前端渲染的：HTML 很快返回，但签到按钮要等框架渲染完成才出现
+  await delay(CONFIG.pageReadyMs);
+  const state = await readPageState(cdp);
+  log(`Page loaded: ${state.title || "(untitled)"}; ${state.url}`);
+  return state;
+}
+
+/** 在已经登录的页面上完成签到。返回状态名。 */
+async function doCheckin(cdp, state) {
+  if (state.already) {
+    log("Already checked in today. Nothing to do.");
+    writeStatus("ALREADY_CHECKED_IN", "already checked in today");
+    return "ALREADY_CHECKED_IN";
+  }
+
+  if (!state.actionable) {
+    log("Could not find the check-in control on the page.", "WARN");
+    writeStatus("NO_BUTTON", "check-in control not found");
+    notify("Noymanga 签到失败", "页面上找不到签到按钮，可能站点改版了。请查看 logs 目录。");
+    return "NO_BUTTON";
+  }
+
+  const result = await requestCheckinWithRetry(cdp);
+  log(`Check-in API response: HTTP ${result.status}; ${result.body || "(empty response)"}`);
+
+  if (!result.ok) {
+    writeStatus("CHECKIN_FAILED", `HTTP ${result.status}`, { body: result.body });
+    notify("Noymanga 签到失败", `服务器返回 HTTP ${result.status}，请查看 logs 目录。`);
+    return "CHECKIN_FAILED";
+  }
+
+  const body = String(result.body || "");
+  const already = /已[签簽]到|already/i.test(body);
+  const stateName = already ? "ALREADY_CHECKED_IN" : "CHECKED_IN";
+  log(already ? "Server says you had already checked in today." : "Check-in confirmed by the server.");
+  writeStatus(stateName, already ? "already checked in today" : "check-in succeeded", {
+    httpStatus: result.status,
+    body: body.slice(0, 200),
+  });
+  if (!already) notify("Noymanga 签到成功", "今天的签到已完成。");
+  return stateName;
+}
+
 async function main() {
   cleanupOldLogs();
+
+  if (NOTIFY_TEST) {
+    log("Sending a test notification...");
+    notify("Noymanga 签到助手", "如果你看到这条通知，说明通知功能正常。");
+    const ok = runPowerShell(toastScript("Noymanga 签到助手", "通知通道自检完成。", 3), 12_000);
+    log(ok ? "Test notification sent." : "Test notification could not be delivered.", ok ? "INFO" : "WARN");
+    return 0;
+  }
 
   const { browsers, notes } = resolveBrowsers();
   for (const note of notes) log(note, "WARN");
@@ -504,101 +851,89 @@ async function main() {
   }
   log(`Browser priority: ${browsers.map((item) => item.name).join(" -> ")}`);
 
+  const headless = FORCE_HEADED ? false : FORCE_HEADLESS ? true : CONFIG.headless !== false;
+
   if (DRY_RUN) {
     log("--dry-run: nothing will be launched.");
-    log(`Profile directory: ${PROFILE_DIR}`);
+    log(`Node version: ${process.version}`);
+    log(`Profile directory: ${PROFILE_DIR} (${fs.existsSync(PROFILE_DIR) ? "exists" : "missing"})`);
     log(`Debug port: ${CONFIG.debugPort}`);
     log(`Target URL: ${CONFIG.url}`);
+    log(`Headless mode: ${headless ? "yes (no window)" : "no (visible window)"}`);
+    log(`Notifications: ${CONFIG.notify ? "on" : "off"}; login timeout: ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s`);
+    log(`Config file: ${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : "(none, using defaults)"}`);
     for (const browser of browsers) log(`  candidate: ${browser.name} => ${browser.exe}`);
-    return;
+    return 0;
   }
 
-  // ① 如果上一次运行留下的浏览器还开着（调试端口仍在），直接复用，避免重复启动
-  let target = await probeTarget();
-  if (target) {
-    log("An existing browser debug session is still open; reusing it.");
-  } else {
-    // ② 否则按优先级依次尝试启动
-    for (const browser of browsers) {
-      log(`Launching ${browser.name}: ${browser.exe}`);
-      const child = spawn(
-        browser.exe,
-        [
-          `--remote-debugging-port=${CONFIG.debugPort}`,
-          `--user-data-dir=${PROFILE_DIR}`,
-          "--remote-allow-origins=*",
-          "--no-first-run",
-          "--no-default-browser-check",
-          CONFIG.url,
-        ],
-        { detached: false, stdio: "ignore" },
-      );
-      child.unref();
-
-      target = await waitForTarget(CONFIG.startTimeoutMs);
-      if (target) {
-        log(`Connected to ${browser.name}.`);
-        break;
-      }
-      log(`${browser.name} did not open the debug port in time; trying the next one.`, "WARN");
-      try {
-        child.kill();
-      } catch (_) {
-        /* 忽略 */
-      }
+  if (LOGIN_ONLY) {
+    log("Login-only mode: a browser window will open on the login page.");
+    const ok = await loginFlow();
+    if (ok) {
+      log("Login saved. Future runs will reuse it.");
+      writeStatus("LOGIN_OK", "login completed");
+      notify("Noymanga 登录成功", "登录态已保存，之后会自动签到。");
+      return 0;
     }
-    if (!target) {
-      fail("None of the browsers opened a debug port in time. Close leftover browser windows and retry.");
+    writeStatus("LOGIN_REQUIRED", "login was not completed in time");
+    notify("Noymanga 需要登录", "登录没有完成，签到暂时无法进行。请运行 登录.bat 重试。");
+    return 2;
+  }
+
+  // ① 先跑一趟：已登录就直接签，未登录就记录状态交给下一阶段
+  let outcome = null;
+  await withBrowser(headless, CONFIG.url, async (cdp) => {
+    const state = await inspectPage(cdp);
+    if (state.login) {
+      outcome = "LOGIN_REQUIRED";
+      return;
     }
+    outcome = await doCheckin(cdp, state);
+  });
+
+  // ② 需要登录：切到有窗口模式，给你 2 分钟
+  if (outcome === "LOGIN_REQUIRED") {
+    log("LOGIN REQUIRED: opening a visible window on the login page.");
+    writeStatus("LOGIN_REQUIRED", "manual login needed", { stage: "waiting" });
+    notify("Noymanga 需要登录", "已弹出登录窗口，请在那 2 分钟内在页面上完成登录。");
+
+    const ok = await loginFlow();
+    if (!ok) {
+      log("Login was not completed in time; the browser window has been closed.", "WARN");
+      writeStatus("LOGIN_TIMEOUT", "login window closed after timeout");
+      notify("Noymanga 登录超时", "登录窗口已自动关闭，今天的签到没有完成。双击 登录.bat 可以重新登录。");
+      return 2;
+    }
+
+    log("Login saved. Continuing with the check-in.");
+    // ③ 登录成功后，重新无窗口跑一趟
+    let finalState = null;
+    await withBrowser(headless, CONFIG.url, async (cdp) => {
+      finalState = await inspectPage(cdp);
+      if (finalState.login) {
+        log("Still seeing the login indicator after login; giving up for today.", "WARN");
+        writeStatus("LOGIN_REQUIRED", "still logged out after login flow");
+        notify("Noymanga 需要登录", "登录后仍然未登录，请手动运行 登录.bat 检查。");
+        finalState = null;
+        return;
+      }
+      await doCheckin(cdp, finalState);
+    });
+    if (!finalState) return 2;
+    return 0;
   }
 
-  const cdp = connectCdp(target.webSocketDebuggerUrl);
-  await cdp.opened;
-  await cdp.send("Page.enable");
-  await cdp.send("Runtime.enable");
-  await cdp.send("Page.navigate", { url: CONFIG.url });
-  // 页面是前端渲染的：HTML 很快返回，但签到按钮要等框架渲染完成才出现
-  await delay(CONFIG.pageReadyMs);
-
-  const state = await readPageState(cdp);
-  log(`Page loaded: ${state.title || "(untitled)"}; ${state.url}`);
-
-  if (state.already) {
-    log("Already checked in today. Closing the browser.");
-    writeStatus("ALREADY_CHECKED_IN", "already checked in today");
-    await closeBrowser(cdp);
-    return;
-  }
-
-  if (state.login) {
-    log("LOGIN REQUIRED: log in once in the browser window, then close it. Cookies are saved automatically.");
-    writeStatus("LOGIN_REQUIRED", "manual login needed");
-    // 故意不关浏览器：留给你手动登录
-    return;
-  }
-
-  if (!state.actionable) {
-    log("Could not find the check-in control. The browser is left open for inspection; nothing was clicked.");
-    writeStatus("NO_BUTTON", "check-in control not found");
-    return;
-  }
-
-  const result = await requestCheckinWithRetry(cdp);
-  log(`Check-in API response: HTTP ${result.status}; ${result.body || "(empty response)"}`);
-
-  if (!result.ok) {
-    log("The server did not accept the check-in request. The browser is left open for inspection.");
-    writeStatus("CHECKIN_FAILED", `HTTP ${result.status}`, { body: result.body });
-    return;
-  }
-
-  log("Check-in confirmed by the server. Closing the browser.");
-  writeStatus("CHECKED_IN", "check-in succeeded", { httpStatus: result.status });
-  await closeBrowser(cdp);
+  // ④ 已登录：签完了，按结果决定退出码
+  return outcome && !["NO_BUTTON", "CHECKIN_FAILED"].includes(outcome) ? 0 : 1;
 }
 
-main().catch((error) => {
-  log(`ERROR: ${error.message}`, "ERROR");
-  writeStatus("ERROR", error.message);
-  process.exitCode = 1;
-});
+main()
+  .then((code) => {
+    if (typeof code === "number") process.exitCode = code;
+  })
+  .catch((error) => {
+    log(`ERROR: ${error.message}`, "ERROR");
+    writeStatus("ERROR", error.message);
+    notify("Noymanga 签到出错", error.message.slice(0, 120));
+    process.exitCode = 1;
+  });

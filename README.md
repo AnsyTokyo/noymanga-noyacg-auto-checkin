@@ -1,155 +1,189 @@
 # Noymanga（Noyacg）每日自动签到（Windows）
 
-一个跑在 Windows 上的 Noymanga 自动签到脚本。它用**你系统的默认浏览器**（Edge / Chrome / Brave / Vivaldi / Opera 等 Chromium 内核浏览器）
-打开一份独立的用户资料（profile）来保存登录状态，每天定时检测签到入口、调用签到接口，并把结果写进日志和 `status.txt`。
+在 Windows 上每天自动完成 Noymanga 的每日签到。它用**你系统的默认浏览器**（Edge / Chrome / Brave / Vivaldi / Opera 等
+Chromium 内核浏览器）打开一份**独立的浏览器配置目录**保存登录态，到点自动检测签到入口、调用签到接口，
+把结果写进日志和 `status.txt`，并用 Windows 通知告诉你成功还是失败。
 
-- 不保存账号密码，登录状态只存在本地的 profile 目录里
+- **双击就能装**：`安装.bat` 是个向导，问你要几点签到，然后自动创建计划任务
+- **平时无窗口**：日常运行时浏览器在后台无窗口执行，不会在午夜弹窗
+- **需要登录时会给你窗口**：登录态失效时自动弹出登录页，给你 2 分钟；超时自动关窗、发通知、退出，不留僵尸窗口
+- 不保存账号密码，登录状态只存在本地 `browser-profile/` 里
 - 不读取、不修改你日常使用的浏览器个人资料
-- 检测不到按钮或未登录时不会乱点，会保留窗口并写日志说明原因
 - 源码里没有任何账号、Cookie、令牌
 
 > 仅限个人学习与自用。请自行确认你的使用方式符合目标网站的服务条款，风险自负。
 
-## 两个版本
+## 快速开始
 
-仓库里保留了两份脚本，**推荐用 v2**：
+**前提**：Windows 10/11 + [Node.js 22 或更高](https://nodejs.org/)（选 LTS）+ 装了 Edge 或 Chrome。
 
-| | v2（推荐） | v1（旧版，保留） |
-| --- | --- | --- |
-| 入口文件 | `noymanga-auto-checkin-v2.js` | `noymanga-auto-checkin.js` |
-| 安装脚本 | `install-daily-task-v2.ps1` | `install-daily-task.ps1` |
-| 用哪个浏览器 | 读注册表识别**系统默认浏览器**，非 Chromium 时自动回落到已装的 Chromium 浏览器 | 写死 Chrome 的三个常见路径 |
-| 启动失败 | 自动换下一个已安装的浏览器 | 直接报错 |
-| 签到请求 | 失败重试 3 次（间隔 3s → 6s），4xx（除 429）不重试 | 只请求一次 |
-| 结果文件 | 额外写 `status.txt` | 只写日志 |
-| 日志清理 | 自动删除 30 天前的日志 | 不清理 |
-| 体检模式 | `--dry-run` 只打印识别结果，不启动、不签到 | 无 |
-| profile 目录 | `browser-profile/` | `chrome-profile/` |
+1. 下载本仓库（`Code` → `Download ZIP`，或 `git clone`）
+2. 双击 **`安装.bat`**
+3. 按提示输入每天签到的时间（直接回车 = `00:00`）
+4. 选择是否开启"开机补签"（推荐开启）
+5. 向导最后会问要不要立刻登录一次，选 `Y` —— 在弹出的浏览器里正常登录 Noymanga，登录完窗口会自动关闭
+
+装完就没事了。之后每天到点自动签到；想提前确认，可以双击 `查看状态.bat`。
+
+## 四个双击即用的入口
+
+| 文件 | 作用 |
+| --- | --- |
+| `安装.bat` | 安装向导：选时间、开机补签、首次登录（也可以用来**改时间**：重新跑一遍即可覆盖旧任务） |
+| `查看状态.bat` | 看计划任务、上次运行时间、最近一次结果、最新日志 |
+| `登录.bat` | 重新登录一次（登录态过期时用，会直接打开登录页） |
+| `卸载.bat` | 删除计划任务（脚本、登录态、日志都保留，想彻底删就删整个文件夹） |
+
+命令行用法（不想用向导时）：
+
+```powershell
+# 直接指定时间安装
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Time 08:30
+
+# 关闭开机补签
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Time 08:30 -NoCatchUp
+
+# 只看计划任务定义，不真正创建
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Time 08:30 -DryRun
+
+# 查看状态 / 重新登录 / 卸载
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Status
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Login
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Uninstall
+```
 
 ## 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
-| `noymanga-auto-checkin-v2.js` | **推荐**的签到主脚本（Node.js） |
-| `install-daily-task-v2.ps1` | 创建每天 00:00 运行 v2 的 Windows 计划任务 |
-| `noymanga-auto-checkin.js` | 旧版签到脚本（仅 Chrome） |
-| `install-daily-task.ps1` | 创建每天 00:00 运行旧版的计划任务 |
-| `browser-profile/` | v2 首次登录后自动生成，保存登录状态（**已被 .gitignore 忽略**） |
-| `chrome-profile/` | v1 首次登录后自动生成（**已被 .gitignore 忽略**） |
-| `logs/` | 每次运行的日志，一天一个文件（**已被 .gitignore 忽略**） |
-| `status.txt` | 最近一次运行的结果（**已被 .gitignore 忽略**） |
+| `noymanga-auto-checkin-v2.js` | **主脚本**（Node.js）：识别默认浏览器、驱动它签到、写日志和状态 |
+| `install-daily-task-v2.ps1` | 安装/管理引擎：生成计划任务 XML、交互式向导、状态查看、登录、卸载 |
+| `安装.bat` / `查看状态.bat` / `登录.bat` / `卸载.bat` | 上面的四个快捷入口（本质都是调用 `install-daily-task-v2.ps1`） |
+| `config.example.json` | 可选的配置文件模板（复制成 `config.json` 后生效） |
+| `noymanga-auto-checkin.js` | 旧版脚本（v1，写死 Chrome 路径，保留给老用户） |
+| `install-daily-task.ps1` | 旧版安装脚本（v1 用） |
+| `browser-profile/` | 首次登录后自动生成，保存登录状态（**已被 .gitignore 忽略**） |
+| `logs/` | 每次运行的日志，一天一个文件，保留 30 天（**已被 .gitignore 忽略**） |
+| `status.txt` | 最近一次运行的结果，给 `查看状态.bat` 读（**已被 .gitignore 忽略**） |
 
-## 环境要求
+## 每天到底发生了什么
 
-- Windows 10 / 11
-- 任意 **Chromium 内核**浏览器：Microsoft Edge（系统自带）、Google Chrome、Brave、Vivaldi、Opera 均可。
-  v2 会自动识别，Firefox 等非 Chromium 浏览器无法用调试协议驱动，会被自动跳过。
-- [Node.js](https://nodejs.org/) **22 或更高版本**（脚本直接用内置的全局 `WebSocket`，Node 22 起才默认可用）
+以 00:00 为例：
 
-## 快速开始（v2）
+```
+00:00  计划任务触发（不弹窗口）
+00:00  启动默认浏览器 headless → 打开 https://noymanga.com/user
+00:01  已登录？ → 调用签到接口 → 写 status.txt → 关闭浏览器
+       未登录？ → 关掉无窗口实例 → 弹出有窗口的登录页，给你 2 分钟
+                   2 分钟内登录成功 → 继续签到 → 关窗口
+                   超时 → 关窗口 → 发通知"登录超时" → 退出（退出码 2）
+```
 
-### 1. 体检：确认脚本认出了你的默认浏览器
+- **开机补签**（默认开启）：如果 00:00 电脑是关机/休眠的，开机后会尽快补跑一次
+- **不唤醒睡眠**：不会为了签到把睡着的电脑叫醒
+- **电池上也会跑**：笔记本没插电也算数
+
+## 结果与通知
+
+`status.txt` 里的 `state` 有这几种：
+
+| state | 含义 | 会发生什么 |
+| --- | --- | --- |
+| `CHECKED_IN` | 签到成功 | 弹通知"签到成功" |
+| `ALREADY_CHECKED_IN` | 今天已经签过了 | 安静退出，不打扰 |
+| `LOGIN_REQUIRED` | 需要重新登录 | 弹登录窗口 + 通知 |
+| `LOGIN_TIMEOUT` | 登录窗口 2 分钟没人操作 | 关窗 + 通知"登录超时"，双击 `登录.bat` 可重来 |
+| `CHECKIN_FAILED` | 服务器拒绝（输出了 HTTP 状态码） | 通知"签到失败" |
+| `NO_BUTTON` | 页面上找不到签到按钮（站点可能改版） | 通知"签到失败" |
+| `ERROR` | 脚本运行出错（网络、浏览器等） | 通知错误摘要 |
+
+通知用的是 Windows 自带的 Toast，不需要装任何东西。如果没看到通知，检查
+**设置 → 系统 → 通知** 里是否允许了 PowerShell / Windows PowerShell 的通知。
+
+## 可选配置 `config.json`
+
+把 `config.example.json` 复制成 `config.json`（同目录），按需修改，**改完立即生效，不用重新安装**：
+
+```json
+{
+  "headless": true,
+  "notify": true,
+  "loginTimeoutSeconds": 120
+}
+```
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `headless` | `true` | `false` 则每次都有可见窗口（排错时用） |
+| `notify` | `true` | `false` 关掉所有 Windows 通知 |
+| `loginTimeoutSeconds` | `120` | 需要登录时给多少秒 |
+| `debugPort` | `19346` | 浏览器调试端口，被占用时改它 |
+
+其它可调项（URL、重试次数、日志保留天数等）见脚本顶部的 `DEFAULT_CONFIG`。
+
+## 怎么知道它在正常工作
 
 ```powershell
+# 查看最近结果
+Get-Content .\status.txt
+
+# 看最新一条日志
+Get-Content (Get-ChildItem .\logs\*.log | Sort-Object LastWriteTime | Select-Object -Last 1)
+
+# 手动跑一次（会真的签到，已签过就什么都不做）
+node .\noymanga-auto-checkin-v2.js
+
+# 只体检，不启动浏览器
 node .\noymanga-auto-checkin-v2.js --dry-run
+
+# 测一下通知能不能弹
+node .\noymanga-auto-checkin-v2.js --notify-test
 ```
-
-期望第一行类似：
-
-```
-[INFO] Browser priority: System default browser (msedge.exe) -> Google Chrome
-[INFO]   candidate: System default browser (msedge.exe) => C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
-```
-
-它只读注册表、打印信息，**不启动浏览器、不联网、不签到**。
-
-### 2. 首次运行并登录
-
-```powershell
-node .\noymanga-auto-checkin-v2.js
-```
-
-会弹出浏览器窗口进入 Noymanga 用户页。如果提示：
-
-```
-[INFO] LOGIN REQUIRED: log in once in the browser window, then close it. Cookies are saved automatically.
-```
-
-就在这个窗口里正常登录，然后用窗口右上角的 **✕ 正常关闭**（不要用任务管理器强杀，Cookie 要正常退出才落盘）。
-
-### 3. 再运行一次，确认签到成功
-
-```powershell
-node .\noymanga-auto-checkin-v2.js
-```
-
-成功后日志会显示 `Check-in API response: HTTP 200` 和 `Check-in confirmed by the server.`，窗口自动关闭。
-
-### 4. 安装每日计划任务
-
-右键 `install-daily-task-v2.ps1` → “使用 PowerShell 运行”，看到 `Created task: Noymanga Daily Check-in` 即成功。
-若提示“拒绝访问”，请以管理员身份打开 PowerShell 再执行一次。
-
-> 两个安装脚本用的是**同一个任务名**，所以运行 v2 的安装脚本会把已有的每日任务切换成 v2，而不是新增第二个任务。
-
-## 结果与日志
-
-`status.txt` 里的 `state` 字段含义：
-
-| state | 含义 |
-| --- | --- |
-| `CHECKED_IN` | 签到成功（接口返回 2xx） |
-| `ALREADY_CHECKED_IN` | 今天已经签过了，本次没有重复请求 |
-| `LOGIN_REQUIRED` | 未登录。窗口会留着，登录并关闭后再跑一次 |
-| `NO_BUTTON` | 找不到签到入口（多半是网站改版），窗口留着便于排查 |
-| `CHECKIN_FAILED` | 接口拒绝或服务器错误，`body` 里有服务端原文 |
-| `ERROR` | 脚本自身出错，`message` 里有原因 |
-
-日志在 `logs/`，一天一个文件，超过 30 天自动清理。查看最近一次：
-
-```powershell
-Get-Content status.txt
-Get-Content (Get-ChildItem logs\*.log | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
-```
-
-也可以随时手动跑：`node .\noymanga-auto-checkin-v2.js`，
-或用任务计划程序找到 `Noymanga Daily Check-in` 右键“运行”。
-
-## 工作原理
-
-1. 读注册表 `HKCU\...\UrlAssociations\https\UserChoice` 得到系统默认浏览器的 ProgId（如 `MSEdgeHTM`），
-   再用 ProgId 查 `HKCR\<ProgId>\shell\open\command` 得到真实 exe 路径；非 Chromium 或读取失败时，按内置候选列表回落。
-2. 用 `--user-data-dir=browser-profile --remote-debugging-port=19346` 启动它，开一个独立的专用窗口。
-3. 通过 DevTools Protocol（CDP）连上页面，等前端渲染完成后用多种特征找“签到”按钮：
-   `button[data-slot="button"].w-full` 精确选择器 + 可见性/命中测试 + 文字正则兜底。
-4. 判断页面状态：已签到 / 未登录 / 可签到，然后按状态决定关闭窗口、保留窗口还是继续。
-5. 在已登录页面的上下文里 `fetch('/api/v4/signin/sign', { method: 'POST', credentials: 'same-origin' })`，
-   由浏览器自动带上 Cookie，服务端返回 `{"status":200,"msg":"success","continuous":N}` 即为签到凭证。
 
 ## 常见问题
 
-**为什么非要单独登录一次？**
-因为脚本用的是独立的 profile 目录，等于一个全新的浏览器配置，没有你日常浏览器的 Cookie。
-而且新版 Chrome/Edge 的 Cookie 有应用绑定加密，不同浏览器、不同账户之间无法通用，所以首次必须在这个专用窗口里登录一次。
-之后登录态就一直在 profile 目录里，不需要再登录。
+**Q：第一天就提示"需要登录"？**
+A：首次使用必须先登录一次（登录态存在 `browser-profile/` 里）。双击 `登录.bat` 登录即可。
 
-**任务没跑 / 窗口没弹出来？**
-计划任务不会在你未登录 Windows 时运行；00:00 需要电脑处于开机且已登录状态。
-可在“任务计划程序”里查看“上次运行结果”，或手动右键“运行”来验证。
+**Q：以前能用，某天开始老是"需要登录"？**
+A：站点的登录 Cookie 会过期。双击 `登录.bat` 重新登录一次就好。也可能是浏览器升级后加密方式变了，重新登录同样能解决。
 
-**网站改版导致失效？**
-日志会写明是 `NO_BUTTON`、`LOGIN_REQUIRED` 还是 `CHECKIN_FAILED`。
-`NO_BUTTON` 说明按钮选择器需要更新，`CHECKIN_FAILED` 说明接口路径或参数变了。
+**Q：`status.txt` 的时间戳没更新？**
+A：说明任务没跑。按顺序检查：① 电脑当时是开着的吗 ② 这个 Windows 账户登录着吗（注销/关机不会跑）③
+`查看状态.bat` 里"上次结果"是不是 `0x0`。如果开机补签开着，开机后会自动补。
 
-**会不会重复签到？**
-不会。页面显示已签到时脚本直接返回 `ALREADY_CHECKED_IN`，不再发请求。
+**Q：页面改版导致 `NO_BUTTON`？**
+A：脚本有精确按钮、元素可点击性、文字兜底三层匹配；真改版了也会写日志，不会乱点。把日志发到 Issues 一起看看。
 
-## 注意
+**Q：双击 `安装.bat` 一闪而过？**
+A：在 PowerShell 里 `cd` 到本目录再执行 `.\安装.bat`，就能看到完整错误信息。
 
-- 电脑需要在 00:00 前后保持开机并已登录 Windows。
-- 网站改版（按钮文字、接口路径）可能导致脚本失效，日志里会写明原因。
-- `browser-profile/`、`chrome-profile/` 里含有登录 Cookie，**不要提交到公开仓库**，`.gitignore` 已默认忽略。
+**Q：公司电脑不让建计划任务？**
+A：需要管理员权限或组策略允许。可以右键 `安装.bat` →「以管理员身份运行」再试。
+
+## 工作原理（给好奇的人）
+
+1. 读注册表 `…\UrlAssociations\https\UserChoice` 找出系统默认浏览器的 ProgId，再从 `HKCR\<ProgId>\shell\open\command`
+   解析出 `.exe` 路径；不是 Chromium 内核就回落到已安装的 Chromium 浏览器
+2. 用 `--remote-debugging-port` 和独立的 `--user-data-dir` 启动它（所以**不会**碰你日常的浏览器资料）
+3. 通过 CDP（Chrome DevTools Protocol）连上去，在页面上下文里 `fetch` 签到接口
+   —— 请求由浏览器自己发出，Cookie 自动带上，不需要在脚本里存任何凭据
+4. 关闭浏览器时用 `Browser.close`，让 Cookie 正常刷盘
+
+## 安全说明
+
+- 仓库里**没有**账号、密码、Cookie、令牌
+- `browser-profile/`（登录态）、`logs/`、`status.txt`、`config.json` 都在 `.gitignore` 里，不会被提交
+- 如果你不小心把 `browser-profile/` 传上去了：**立刻去 Noymanga 改密码**，然后删除整个仓库重新建
+
+## 环境要求
+
+| 项目 | 要求 |
+| --- | --- |
+| 系统 | Windows 10 / 11 |
+| Node.js | 22 或更高（脚本用了全局 `WebSocket`） |
+| 浏览器 | Edge / Chrome / Brave / Vivaldi / Opera 等 Chromium 内核浏览器 |
 
 ## License
 
-MIT
+[MIT](LICENSE)
