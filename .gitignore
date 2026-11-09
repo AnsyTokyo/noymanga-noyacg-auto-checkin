@@ -1,9 +1,13 @@
 # 登录状态（含 Cookie，绝对不能提交）
 chrome-profile/
+browser-profile/
 
 # 运行日志
 logs/
 *.log
+
+# 最近一次运行结果
+status.txt
 
 # 系统 / 编辑器杂项
 Thumbs.db
