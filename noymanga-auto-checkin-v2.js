@@ -94,6 +94,48 @@ const STATUS_FILE = path.join(ROOT, "status.txt");
 const LOGIN_TRIGGER_FILE = path.join(LOG_DIR, ".login-trigger");
 const LOGIN_TRIGGER_COOLDOWN_MS = 10_000;
 
+// 同一时间只允许一个实例。安装向导里的「立即运行一次」很容易和定时任务撞车，
+// 两个进程抢同一个浏览器配置目录，页面就会直接崩溃（Target crashed）。
+const LOCK_FILE = path.join(LOG_DIR, ".lock");
+const LOCK_STALE_MS = 10 * 60_000;
+
+function processAlive(pid) {
+  if (!pid || !Number.isFinite(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function acquireLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const stale = Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS;
+      const owner = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+      if (!stale && processAlive(owner)) return false;
+    }
+    fs.writeFileSync(LOCK_FILE, String(process.pid), "utf8");
+    return true;
+  } catch (_) {
+    return true; // 锁只是防呆，出错不能反过来挡住签到
+  }
+}
+
+function releaseLock() {
+  try {
+    if (
+      fs.existsSync(LOCK_FILE) &&
+      fs.readFileSync(LOCK_FILE, "utf8").trim() === String(process.pid)
+    ) {
+      fs.unlinkSync(LOCK_FILE);
+    }
+  } catch (_) {
+    /* 忽略 */
+  }
+}
+
 const ARGS = new Set(process.argv.slice(2));
 const DRY_RUN = ARGS.has("--dry-run");
 const LOGIN_ONLY = ARGS.has("--login");
@@ -1086,16 +1128,41 @@ async function main() {
     return 2;
   }
 
+  if (!acquireLock()) {
+    log("Another instance is already running; skipping this run.", "WARN");
+    return 0;
+  }
+
+  const checkinPass = async () => {
+    let result = null;
+    await withBrowser(headless, CONFIG.url, async (cdp) => {
+      const state = await inspectPage(cdp);
+      if (state.login) {
+        result = "LOGIN_REQUIRED";
+        return;
+      }
+      result = await doCheckin(cdp, state);
+    });
+    return result;
+  };
+
   // ① 先跑一趟：已登录就直接签，未登录就记录状态交给下一阶段
   let outcome = null;
-  await withBrowser(headless, CONFIG.url, async (cdp) => {
-    const state = await inspectPage(cdp);
-    if (state.login) {
-      outcome = "LOGIN_REQUIRED";
-      return;
+  try {
+    outcome = await checkinPass();
+  } catch (error) {
+    // 页面目标崩溃，多半是上一次运行留下的浏览器没退干净，还占着同一个配置目录。
+    // 清掉残留实例再完整重试一次，比直接把 ERROR 写进状态有用得多。
+    log(`First attempt failed (${error.message}); cleaning up and retrying once.`, "WARN");
+    try {
+      if (await probeTarget()) await shutdownBrowser({ label: "Crashed browser" });
+      await waitForPortClosed(5_000);
+    } catch (_) {
+      /* 清理失败也要继续重试 */
     }
-    outcome = await doCheckin(cdp, state);
-  });
+    await delay(3_000);
+    outcome = await checkinPass();
+  }
 
   // ② 需要登录：切到有窗口模式，给你 2 分钟
   if (outcome === "LOGIN_REQUIRED") {
@@ -1140,6 +1207,9 @@ async function main() {
 main()
   .then((code) => {
     if (typeof code === "number") process.exitCode = code;
+  })
+  .finally(() => {
+    releaseLock();
   })
   .catch((error) => {
     log(`ERROR: ${error.message}`, "ERROR");
