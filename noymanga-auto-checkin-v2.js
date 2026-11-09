@@ -762,7 +762,7 @@ async function launchBrowser(headless, startUrl) {
       "--no-first-run",
       "--no-default-browser-check",
     ];
-    if (headless) args.push("--headless=new", "--hide-scrollbars", "--mute-audio");
+    if (headless) args.push("--headless=new", "--hide-scrollbars", "--mute-audio", "--disable-gpu");
     args.push(startUrl);
 
     let child;
@@ -792,9 +792,36 @@ async function launchBrowser(headless, startUrl) {
  * 打开浏览器 → 连上 → 执行 fn(cdp) → 关掉浏览器。
  * headless 启动失败时自动回退到有窗口模式（有些机器/杀软会拦 headless）。
  */
+// 端口上挂着的目标未必还活着：上一个进程刚被杀掉时，端口可能还开着几秒，
+// 这时候去「复用」只会得到一串超时。先 ping 一下再决定。
+async function pingTarget(target) {
+  const cdp = connectCdp(target.webSocketDebuggerUrl);
+  try {
+    await Promise.race([
+      cdp.opened,
+      new Promise((resolve, reject) => setTimeout(() => reject(new Error("connect timeout")), 4_000)),
+    ]);
+    await cdp.send("Runtime.evaluate", { expression: "1+1", returnByValue: true });
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    try {
+      cdp.close();
+    } catch (_) {
+      /* 忽略 */
+    }
+  }
+}
+
 async function withBrowser(headless, startUrl, fn) {
   // 上一次运行残留的会话直接复用，避免重复启动
   let target = await probeTarget();
+  if (target && !(await pingTarget(target))) {
+    log("A stale debugging target was found but does not respond; discarding it.", "WARN");
+    target = null;
+    await waitForPortClosed(5_000);
+  }
   let usedHeadless = headless;
   let childPid = 0;
   if (target) {
@@ -1171,7 +1198,11 @@ async function main() {
 
   // 上一轮崩掉留下的浏览器会占着配置目录，启动前先清一遍
   const stale = killStaleBrowsers();
-  if (stale > 0) log(`Cleaned up ${stale} leftover browser process(es) before starting.`);
+  if (stale > 0) {
+    log(`Cleaned up ${stale} leftover browser process(es) before starting.`);
+    await waitForPortClosed(10_000);
+    await delay(1_500);
+  }
 
   if (!acquireLock()) {
     log("Another instance is already running; skipping this run.", "WARN");
