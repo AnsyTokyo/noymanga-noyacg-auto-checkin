@@ -141,6 +141,7 @@ const DRY_RUN = ARGS.has("--dry-run");
 const LOGIN_ONLY = ARGS.has("--login");
 const NOTIFY_TEST = ARGS.has("--notify-test");
 const NOTIFY_ACTION_TEST = ARGS.has("--notify-action-test");
+const CLEANUP_ONLY = ARGS.has("--cleanup");
 // 命令行显式指定的模式优先于 config.json
 const FORCE_HEADLESS = ARGS.has("--headless");
 const FORCE_HEADED = ARGS.has("--headed");
@@ -678,6 +679,36 @@ async function evaluate(cdp, expression) {
  * （这就是以前登录成功后窗口关不掉的原因），所以这里优先从
  * /json/version 的浏览器级 WebSocket 发；5 秒还没退出就按 pid 强杀进程树。
  */
+// 上一次运行如果崩在半路，会留下还在跑、但已经没用的浏览器进程：
+// 它们占着配置目录，还会让计划任务一直显示「正在运行」，新的运行直接被拒。
+// 这里按命令行里的配置目录路径把它们找出来清掉。
+function killStaleBrowsers() {
+  let killed = 0;
+  try {
+    const script = [
+      "Get-CimInstance Win32_Process",
+      `Where-Object { $_.CommandLine -like '*${PROFILE_DIR}*' -and $_.Name -match '^(msedge|chrome)' }`,
+      "ForEach-Object { $_.ProcessId }",
+    ].join(" | ");
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 20_000,
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const pid = Number(line.trim());
+      if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) {
+        log(`Terminating stale browser process pid ${pid}.`, "WARN");
+        killProcessTree(pid);
+        killed += 1;
+      }
+    }
+  } catch (_) {
+    /* 查不到就算了，不能因为清理失败挡住签到 */
+  }
+  return killed;
+}
+
 async function shutdownBrowser({ cdp = null, pid = 0, label = "Browser" } = {}) {
   // ① 页面会话里也发一次（老版本浏览器认这个）
   if (cdp) {
@@ -1128,6 +1159,20 @@ async function main() {
     return 2;
   }
 
+  if (CLEANUP_ONLY) {
+    const killed = killStaleBrowsers();
+    if (killed === 0) {
+      log("No leftover browser processes were found.");
+    } else {
+      log(`Cleaned up ${killed} leftover browser process(es).`);
+    }
+    return 0;
+  }
+
+  // 上一轮崩掉留下的浏览器会占着配置目录，启动前先清一遍
+  const stale = killStaleBrowsers();
+  if (stale > 0) log(`Cleaned up ${stale} leftover browser process(es) before starting.`);
+
   if (!acquireLock()) {
     log("Another instance is already running; skipping this run.", "WARN");
     return 0;
@@ -1157,6 +1202,7 @@ async function main() {
     try {
       if (await probeTarget()) await shutdownBrowser({ label: "Crashed browser" });
       await waitForPortClosed(5_000);
+      killStaleBrowsers();
     } catch (_) {
       /* 清理失败也要继续重试 */
     }
