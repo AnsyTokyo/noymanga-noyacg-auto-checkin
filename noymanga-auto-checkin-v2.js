@@ -484,6 +484,36 @@ function getJson(url) {
   });
 }
 
+/** 取浏览器级别的 WebSocket 地址（/json/version），浏览器级命令要从这里发。 */
+async function getBrowserWsUrl() {
+  try {
+    const info = await getJson(`http://127.0.0.1:${CONFIG.debugPort}/json/version`);
+    return info && info.webSocketDebuggerUrl ? info.webSocketDebuggerUrl : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** 按 pid 强杀整棵进程树（浏览器不响应关闭请求时的最后手段）。 */
+function killProcessTree(pid) {
+  if (!pid) return false;
+  try {
+    const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.unref();
+    return true;
+  } catch (_) {
+    try {
+      process.kill(pid);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+}
+
 /** 探测一次调试端口，拿到当前可用的页面目标；没有则返回 null。 */
 async function probeTarget() {
   try {
@@ -566,13 +596,45 @@ async function evaluate(cdp, expression) {
   return result.result.value;
 }
 
-/** 用 CDP 优雅关闭浏览器（让 Cookie 等数据刷盘）。 */
-async function closeBrowser(cdp) {
-  try {
-    await cdp.send("Browser.close");
-  } catch (_) {
-    /* 可能已经关闭 */
+/**
+ * 关掉浏览器，并且**确认它真的退出了**。
+ *
+ * 注意：Browser.close 属于浏览器级命令，从「页面会话」发往往被忽略
+ * （这就是以前登录成功后窗口关不掉的原因），所以这里优先从
+ * /json/version 的浏览器级 WebSocket 发；5 秒还没退出就按 pid 强杀进程树。
+ */
+async function shutdownBrowser({ cdp = null, pid = 0, label = "Browser" } = {}) {
+  // ① 页面会话里也发一次（老版本浏览器认这个）
+  if (cdp) {
+    try {
+      await cdp.send("Browser.close");
+    } catch (_) {
+      /* 已经关了也没关系 */
+    }
   }
+
+  // ② 浏览器级会话是正主
+  const browserWs = await getBrowserWsUrl();
+  if (browserWs) {
+    try {
+      const browserCdp = connectCdp(browserWs);
+      await browserCdp.opened;
+      await browserCdp.send("Browser.close");
+      browserCdp.close();
+    } catch (_) {
+      /* 忽略：下面还有兜底 */
+    }
+  }
+
+  if (await waitForPortClosed(5_000)) return true;
+
+  // ③ 兜底：按 pid 杀掉整棵进程树
+  if (killProcessTree(pid)) {
+    log(`${label} ignored the close request; terminated it by process id.`, "WARN");
+    return await waitForPortClosed(5_000);
+  }
+  log(`${label} is still running after the close request.`, "WARN");
+  return false;
 }
 
 /* ============================================================
@@ -604,13 +666,14 @@ async function launchBrowser(headless, startUrl) {
     }
 
     const target = await waitForTarget(CONFIG.startTimeoutMs);
-    if (target) return { target, browser };
+    if (target) return { target, browser, pid: child.pid || 0 };
     log(`${browser.name} did not open the debug port in time; trying the next one.`, "WARN");
     try {
       child.kill();
     } catch (_) {
       /* 忽略 */
     }
+    killProcessTree(child.pid);
     await delay(1_000);
   }
   return null;
@@ -624,6 +687,7 @@ async function withBrowser(headless, startUrl, fn) {
   // 上一次运行残留的会话直接复用，避免重复启动
   let target = await probeTarget();
   let usedHeadless = headless;
+  let childPid = 0;
   if (target) {
     log("An existing browser debug session is still open; reusing it.");
   } else {
@@ -638,6 +702,7 @@ async function withBrowser(headless, startUrl, fn) {
       fail("None of the browsers opened a debug port in time. Close leftover browser windows and retry.");
     }
     target = launched.target;
+    childPid = launched.pid || 0;
   }
 
   const cdp = connectCdp(target.webSocketDebuggerUrl);
@@ -648,9 +713,9 @@ async function withBrowser(headless, startUrl, fn) {
   try {
     return await fn(cdp, usedHeadless);
   } finally {
-    await closeBrowser(cdp);
+    // 关不掉就强杀，避免把窗口/进程留在后台
+    await shutdownBrowser({ cdp, pid: childPid });
     cdp.close();
-    await waitForPortClosed(10_000);
   }
 }
 
@@ -778,16 +843,9 @@ async function loginFlow() {
   // 1) 先确保没有同 profile 的实例占着（Chrome 的 profile 是独占的）
   const existing = await probeTarget();
   if (existing) {
-    try {
-      const cdp = connectCdp(existing.webSocketDebuggerUrl);
-      await cdp.opened;
-      await closeBrowser(cdp);
-      cdp.close();
-    } catch (_) {
-      /* 忽略 */
-    }
+    await shutdownBrowser({ label: "Leftover browser instance" });
+    await waitForPortClosed(5_000);
   }
-  await waitForPortClosed(10_000);
 
   // 2) 有窗口启动，直接落在登录页
   const launched = await launchBrowser(false, CONFIG.loginUrl);
@@ -829,10 +887,9 @@ async function loginFlow() {
     else log(`Login timed out after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s.`, "WARN");
     return false;
   } finally {
-    // 无论成功失败都关掉，绝不留僵尸窗口
-    await closeBrowser(cdp);
+    // 无论成功失败都关掉，绝不留僵尸窗口（关不掉就强杀）
+    await shutdownBrowser({ cdp, pid: launched.pid || 0, label: "Login window" });
     cdp.close();
-    await waitForPortClosed(10_000);
   }
 }
 
