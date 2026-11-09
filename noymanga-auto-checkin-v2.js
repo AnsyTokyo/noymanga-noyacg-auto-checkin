@@ -1310,6 +1310,16 @@ main()
   })
   .catch((error) => {
     log(`ERROR: ${error.message}`, "ERROR");
+    // 浏览器自己的抱怨（渲染进程崩溃等）往往就在 stderr 里，顺手抄进运行日志
+    try {
+      const stderrPath = path.join(LOG_DIR, "browser-stderr.log");
+      if (fs.existsSync(stderrPath)) {
+        const tail = fs.readFileSync(stderrPath, "utf8").trim().split(/\\r?\\n/).slice(-12);
+        for (const line of tail) if (line.trim()) log(`browser: ${line.trim()}`, "ERROR");
+      }
+    } catch (_) {
+      /* 读不到就算了 */
+    }
     writeStatus("ERROR", error.message);
     notify("Noymanga 签到出错", error.message.slice(0, 120));
     process.exitCode = 1;
