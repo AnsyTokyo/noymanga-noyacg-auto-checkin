@@ -308,6 +308,8 @@ if ($Login) {
 # 安装 / 修改
 # ---------------------------------------------------------------
 Write-Head 'Noymanga 每日自动签到 · 安装向导'
+Write-Host '  提示：本程序不需要管理员权限，直接双击运行即可。' -ForegroundColor DarkGray
+Write-Host '        （创建的是「只在你登录时运行」的个人任务，写的是你自己的注册表项。）' -ForegroundColor DarkGray
 
 if (-not (Test-Path -LiteralPath $scriptPath)) {
     Write-Host "  找不到脚本：$scriptPath" -ForegroundColor Red
