@@ -128,6 +128,12 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
     $catchUpText = if ($catchUp) { 'true' } else { 'false' }
     $escapedScript = [System.Security.SecurityElement]::Escape($scriptPath)
     $escapedDir = [System.Security.SecurityElement]::Escape($scriptDir)
+    # 计划任务直接调 node.exe 会闪黑窗口；改用 wscript + run-hidden.vbs 静默启动
+    $hiddenLauncher = Join-Path $scriptDir 'run-hidden.vbs'
+    $escapedLauncher = [System.Security.SecurityElement]::Escape($hiddenLauncher)
+    $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $escapedWscript = [System.Security.SecurityElement]::Escape($wscriptPath)
+    $launcherArgs = '"{0}" "{1}" "{2}"' -f $escapedLauncher, ([System.Security.SecurityElement]::Escape($node)), $escapedScript
 
     return @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -172,8 +178,8 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$([System.Security.SecurityElement]::Escape($node))</Command>
-      <Arguments>"$escapedScript"</Arguments>
+      <Command>$escapedWscript</Command>
+      <Arguments>$launcherArgs</Arguments>
       <WorkingDirectory>$escapedDir</WorkingDirectory>
     </Exec>
   </Actions>
@@ -270,7 +276,9 @@ $protocolScheme = 'noymanga'
 function Register-LoginProtocol([string]$nodePath, [string]$targetScript) {
     $root = "HKCU:\Software\Classes\$protocolScheme"
     $commandKey = Join-Path $root 'shell\open\command'
-    $command = '"{0}" "{1}" --login' -f $nodePath, $targetScript
+    $hiddenLauncher = Join-Path $scriptDir 'run-hidden.vbs'
+    $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $command = '"{0}" //B "{1}" "{2}" "{3}" --login' -f $wscriptPath, $hiddenLauncher, $nodePath, $targetScript
     New-Item -Path $root -Force | Out-Null
     Set-ItemProperty -Path $root -Name '(default)' -Value 'URL:Noymanga Auto Check-in Login'
     New-ItemProperty -Path $root -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
