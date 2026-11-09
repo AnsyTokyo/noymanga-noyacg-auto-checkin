@@ -114,6 +114,57 @@ function Find-Node {    try {
     }
 }
 
+function Ensure-Runner {
+    # 生成一个「无控制台窗口」的小启动器（C# 编译成 exe），任务用它来调 node。
+    # 不用 VBScript：新版 Windows 正在弃用 VBScript，会弹「VBScript Usage Detected」。
+    $runner = Join-Path $scriptDir 'noymanga-runner.exe'
+    if (Test-Path -LiteralPath $runner) { return $runner }
+
+    $source = 
+@'
+using System.Diagnostics;
+using System.Text;
+
+class NoymangaRunner
+{
+    static string Quote(string value)
+    {
+        return "\"" + value.Replace("\"", "\\\"") + "\"";
+    }
+
+    static int Main(string[] args)
+    {
+        if (args.Length < 1) return 1;
+        var psi = new ProcessStartInfo(args[0]);
+        var sb = new StringBuilder();
+        for (int i = 1; i < args.Length; i++)
+        {
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append(Quote(args[i]));
+        }
+        psi.Arguments = sb.ToString();
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        try
+        {
+            using (var p = Process.Start(psi))
+            {
+                p.WaitForExit();
+                return p.ExitCode;
+            }
+        }
+        catch
+        {
+            return 1;
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $source -OutputAssembly $runner -OutputType WindowsApplication -ErrorAction Stop
+    return $runner
+}
+
 function ConvertTo-TaskTime([string]$text) {
     # 接受 8:30 / 08:30 / 8：30（全角冒号）等写法，返回 HH:mm
     $clean = $text.Trim() -replace '：', ':'
@@ -128,12 +179,18 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
     $catchUpText = if ($catchUp) { 'true' } else { 'false' }
     $escapedScript = [System.Security.SecurityElement]::Escape($scriptPath)
     $escapedDir = [System.Security.SecurityElement]::Escape($scriptDir)
-    # 计划任务直接调 node.exe 会闪黑窗口；改用 wscript + run-hidden.vbs 静默启动
-    $hiddenLauncher = Join-Path $scriptDir 'run-hidden.vbs'
-    $escapedLauncher = [System.Security.SecurityElement]::Escape($hiddenLauncher)
-    $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
-    $escapedWscript = [System.Security.SecurityElement]::Escape($wscriptPath)
-    $launcherArgs = '"{0}" "{1}" "{2}"' -f $escapedLauncher, ([System.Security.SecurityElement]::Escape($node)), $escapedScript
+    # 计划任务直接调 node.exe 会闪一下黑窗口；用编译出来的 noymanga-runner.exe 静默启动
+    $escapedNode = [System.Security.SecurityElement]::Escape($node)
+    $runnerPath = $null
+    try { $runnerPath = Ensure-Runner } catch { Write-Warning ("启动器生成失败，将直接调用 node（每晚可能闪一下黑窗口）：" + $_.Exception.Message) }
+    if ($runnerPath) {
+        $commandPath = $runnerPath
+        $launcherArgs = '"{0}" "{1}"' -f $escapedNode, $escapedScript
+    } else {
+        $commandPath = $node
+        $launcherArgs = '"{0}"' -f $escapedScript
+    }
+    $escapedCommand = [System.Security.SecurityElement]::Escape($commandPath)
 
     return @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -178,7 +235,7 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$escapedWscript</Command>
+      <Command>$escapedCommand</Command>
       <Arguments>$launcherArgs</Arguments>
       <WorkingDirectory>$escapedDir</WorkingDirectory>
     </Exec>
@@ -276,9 +333,13 @@ $protocolScheme = 'noymanga'
 function Register-LoginProtocol([string]$nodePath, [string]$targetScript) {
     $root = "HKCU:\Software\Classes\$protocolScheme"
     $commandKey = Join-Path $root 'shell\open\command'
-    $hiddenLauncher = Join-Path $scriptDir 'run-hidden.vbs'
-    $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
-    $command = '"{0}" //B "{1}" "{2}" "{3}" --login' -f $wscriptPath, $hiddenLauncher, $nodePath, $targetScript
+    $runnerPath = $null
+    try { $runnerPath = Ensure-Runner } catch { $runnerPath = $null }
+    if ($runnerPath) {
+        $command = '"{0}" "{1}" "{2}" --login' -f $runnerPath, $nodePath, $targetScript
+    } else {
+        $command = '"{0}" "{1}" --login' -f $nodePath, $targetScript
+    }
     New-Item -Path $root -Force | Out-Null
     Set-ItemProperty -Path $root -Name '(default)' -Value 'URL:Noymanga Auto Check-in Login'
     New-ItemProperty -Path $root -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
