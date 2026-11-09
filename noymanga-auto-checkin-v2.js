@@ -820,7 +820,9 @@ async function withBrowser(headless, startUrl, fn) {
   if (target && !(await pingTarget(target))) {
     log("A stale debugging target was found but does not respond; discarding it.", "WARN");
     target = null;
-    await waitForPortClosed(5_000);
+    // 端口上还挂着不响应的监听者时直接启动，新的浏览器会接管失败、连上旧端口 → 超时。
+    killStaleBrowsers();
+    await waitForPortClosed(8_000);
   }
   let usedHeadless = headless;
   let childPid = 0;
