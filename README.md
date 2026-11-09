@@ -125,6 +125,7 @@ node .\noymanga-auto-checkin-v2.js --notify-action-test   # 弹一条可点击�
 {
   "headless": true,
   "notify": true,
+  "notifyAlready": true,
   "loginTimeoutSeconds": 120
 }
 ```
@@ -134,6 +135,8 @@ node .\noymanga-auto-checkin-v2.js --notify-action-test   # 弹一条可点击�
 | `headless` | `true` | `false` 则每次都有可见窗口（排错时用） |
 | `notify` | `true` | `false` 关掉所有 Windows 通知 |
 | `notifyAction` | `true` | `false` 则通知不可点击（就不用注册 noymanga:// 协议） |
+| `notifyAlready` | `true` | 今天已经签过了也弹一条通知（确认任务确实跑过） |
+| `notifyWaitMs` | `12000` | 等通知弹出的最长时间（计划任务会在脚本退出时回收子进程，所以要等） |
 | `loginTimeoutSeconds` | `120` | 需要登录时给多少秒 |
 | `debugPort` | `19346` | 浏览器调试端口，被占用时改它 |
 

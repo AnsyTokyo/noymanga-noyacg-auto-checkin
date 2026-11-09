@@ -2,5 +2,6 @@
   "headless": true,
   "notify": true,
   "notifyAction": true,
+  "notifyAlready": true,
   "loginTimeoutSeconds": 120
 }

@@ -53,6 +53,8 @@ const DEFAULT_CONFIG = {
   notify: true,                              // 是否弹 Windows 通知
   notifyAction: true,                        // 需要登录的通知可点击（点了直接打开登录窗口）
   protocolScheme: "noymanga",                // 通知点击用的自定义协议，由安装脚本注册
+  notifyWaitMs: 12_000,                      // 等通知真正弹出来再退出（计划任务会回收子进程）
+  notifyAlready: true,                       // 今天已经签过了也弹一条，方便确认任务跑过
   loginTimeoutSeconds: 120,                  // 需要登录时，给你多久时间登录
   startTimeoutMs: 35_000,                    // 等待浏览器开放调试端口的上限
   pollIntervalMs: 500,                       // 轮询间隔
@@ -250,18 +252,29 @@ function notify(title, message, options = {}) {
   const wantAction = options.action === true && CONFIG.notifyAction !== false;
   const actionUrl = wantAction && isProtocolRegistered() ? loginProtocolUrl() : null;
   if (wantAction && !actionUrl) log("Notification action skipped: protocol handler not installed.", "WARN");
-  // 不等待：通知是"尽力而为"，不能拖慢或拖垮签到
-  const script = toastScript(title, message, 8, actionUrl);
+  const script = toastScript(title, message, 3, actionUrl);
   const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded];
+  // 必须等 PowerShell 把通知交给系统之后再返回：
+  // 计划任务在 node 退出时会回收整棵进程树，纯分离的子进程可能还没弹窗就被杀掉。
   try {
-    const child = spawn(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-      { stdio: "ignore", windowsHide: true, detached: true },
-    );
-    child.unref();
+    execFileSync("powershell.exe", args, {
+      stdio: "ignore",
+      windowsHide: true,
+      timeout: CONFIG.notifyWaitMs,
+    });
+    log("Notification shown.");
   } catch (error) {
-    log(`Notification skipped: ${error.message}`, "WARN");
+    if (error.code === "ETIMEDOUT") {
+      log("Notification did not finish in time; gave up waiting.", "WARN");
+      return;
+    }
+    log(`Notification wait failed (${error.message}); falling back to a detached process.`, "WARN");
+    try {
+      spawn("powershell.exe", args, { stdio: "ignore", windowsHide: true, detached: true }).unref();
+    } catch (_) {
+      /* 通知是尽力而为，失败不影响签到 */
+    }
   }
 }
 
@@ -939,6 +952,9 @@ async function doCheckin(cdp, state) {
   if (state.already) {
     log("Already checked in today. Nothing to do.");
     writeStatus("ALREADY_CHECKED_IN", "already checked in today");
+    if (CONFIG.notifyAlready !== false) {
+      notify("Noymanga 今天已签到", "今天已经签过了，不需要重复签到。");
+    }
     return "ALREADY_CHECKED_IN";
   }
 
@@ -979,6 +995,8 @@ async function doCheckin(cdp, state) {
   if (!already) {
     const suffix = continuous !== null ? `已连续签到 ${continuous} 天。` : "今天的签到已完成。";
     notify("Noymanga 签到成功", suffix);
+  } else if (CONFIG.notifyAlready !== false) {
+    notify("Noymanga 今天已签到", "服务器说今天已经签过了，无需重复签到。");
   }
   return stateName;
 }
