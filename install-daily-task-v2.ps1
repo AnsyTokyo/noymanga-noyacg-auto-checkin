@@ -1,22 +1,26 @@
-﻿#
-# Noymanga 每日自动签到 —— 安装 / 修改 / 登录 / 查看 / 取消 / 卸载
-#
-# 用法（双击 bat 更省事）：
-#   .\install-daily-task-v2.ps1                   交互式安装向导
-#   .\install-daily-task-v2.ps1 -Time 08:30       指定签到时间
-#   .\install-daily-task-v2.ps1 -Time 07:15 -NoCatchUp
-#   .\install-daily-task-v2.ps1 -Status           查看上次结果
-#   .\install-daily-task-v2.ps1 -Login            重新登录
-#   .\install-daily-task-v2.ps1 -RemoveTask       取消自动签到（保留脚本和登录态）
-#   .\install-daily-task-v2.ps1 -Uninstall        卸载（删任务 + 删通知协议）
-#
+﻿<#
+.SYNOPSIS
+    Noymanga 每日自动签到：安装 / 修改 / 查看 / 卸载。
+
+.DESCRIPTION
+    双击「安装.bat」即可进入交互式安装向导：选择签到时间、是否开机补签、
+    是否现在就登录一次。装完会在 Windows 任务计划程序里创建
+    「Noymanga Daily Check-in」每天定时运行。
+
+.EXAMPLE
+    .\install-daily-task-v2.ps1                  # 交互式向导
+    .\install-daily-task-v2.ps1 -Time 08:30      # 直接指定签到时间
+    .\install-daily-task-v2.ps1 -Time 07:15 -NoCatchUp
+    .\install-daily-task-v2.ps1 -Status          # 查看最近一次结果
+    .\install-daily-task-v2.ps1 -Login           # 只是重新登录
+    .\install-daily-task-v2.ps1 -Uninstall       # 删除计划任务
+#>
 [CmdletBinding()]
 param(
     [string]$Time,
     [switch]$NoCatchUp,
     [switch]$Status,
     [switch]$Uninstall,
-    [switch]$RemoveTask,
     [switch]$Login,
     [switch]$Quiet,
     [switch]$DryRun,
@@ -31,10 +35,7 @@ $statusFile = Join-Path $scriptDir 'status.txt'
 $logDir = Join-Path $scriptDir 'logs'
 $taskName = 'Noymanga Daily Check-in'
 
-# ---------------------------------------------------------------
-# 管理员权限：安装 / 取消签到 / 卸载 需要写计划任务，Windows 会要求提权。
-# 这里自动判断并弹一次 UAC，所以「双击 → 点『是』」就够了，不用右键。
-# ---------------------------------------------------------------
+# 需要管理员权限的操作：安装 / 改时间 / 卸载。没权限时自动弹一次 UAC 提权，双击即可。
 function Test-IsElevated {
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -45,31 +46,28 @@ function Test-IsElevated {
     }
 }
 
-$needsAdmin = $RemoveTask -or $Uninstall -or (-not ($Status -or $Login -or $DryRun))
+$needsAdmin = $Uninstall -or (-not ($Status -or $Login -or $DryRun))
+
 if ($needsAdmin -and -not $ElevatedOk -and -not (Test-IsElevated)) {
     $forward = @()
     if ($Time) { $forward += @('-Time', $Time) }
     if ($NoCatchUp) { $forward += '-NoCatchUp' }
-    if ($RemoveTask) { $forward += '-RemoveTask' }
     if ($Uninstall) { $forward += '-Uninstall' }
     if ($Quiet) { $forward += '-Quiet' }
-    $argumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-ElevatedOk') + $forward
 
     Write-Host ''
-    Write-Host '  正在请求管理员权限……' -ForegroundColor Yellow
+    Write-Host '  这一步需要管理员权限（Windows 计划任务），正在请求提权……' -ForegroundColor Yellow
     Write-Host '  如果弹出「你要允许此应用对你的设备进行更改吗？」，点「是」即可。' -ForegroundColor DarkGray
-    Write-Host '  同意后，接下来的操作会在新窗口里继续进行。' -ForegroundColor DarkGray
+
+    $argumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-ElevatedOk') + $forward
     try {
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentList -Verb RunAs | Out-Null
-        Start-Sleep -Milliseconds 600
     } catch {
-        Write-Host ''
-        Write-Host '  提权被取消（或者系统不允许），安装没有完成。' -ForegroundColor Red
-        Write-Host ('  详情：' + $_.Exception.Message)
-        if (-not $Quiet) { Read-Host ' 按回车键关闭' | Out-Null }
+        Write-Host '  提权被取消或失败：' -ForegroundColor Red
+        Write-Host ('  ' + $_.Exception.Message)
         exit 1
     }
-    exit 0
+    return
 }
 function Write-Head($text) {
     Write-Host ''
@@ -114,57 +112,6 @@ function Find-Node {    try {
     }
 }
 
-function Ensure-Runner {
-    # 生成一个「无控制台窗口」的小启动器（C# 编译成 exe），任务用它来调 node。
-    # 不用 VBScript：新版 Windows 正在弃用 VBScript，会弹「VBScript Usage Detected」。
-    $runner = Join-Path $scriptDir 'noymanga-runner.exe'
-    if (Test-Path -LiteralPath $runner) { return $runner }
-
-    $source = 
-@'
-using System.Diagnostics;
-using System.Text;
-
-class NoymangaRunner
-{
-    static string Quote(string value)
-    {
-        return "\"" + value.Replace("\"", "\\\"") + "\"";
-    }
-
-    static int Main(string[] args)
-    {
-        if (args.Length < 1) return 1;
-        var psi = new ProcessStartInfo(args[0]);
-        var sb = new StringBuilder();
-        for (int i = 1; i < args.Length; i++)
-        {
-            if (sb.Length > 0) sb.Append(' ');
-            sb.Append(Quote(args[i]));
-        }
-        psi.Arguments = sb.ToString();
-        psi.UseShellExecute = false;
-        psi.CreateNoWindow = true;
-        try
-        {
-            using (var p = Process.Start(psi))
-            {
-                p.WaitForExit();
-                return p.ExitCode;
-            }
-        }
-        catch
-        {
-            return 1;
-        }
-    }
-}
-'@
-
-    Add-Type -TypeDefinition $source -OutputAssembly $runner -OutputType WindowsApplication -ErrorAction Stop
-    return $runner
-}
-
 function ConvertTo-TaskTime([string]$text) {
     # 接受 8:30 / 08:30 / 8：30（全角冒号）等写法，返回 HH:mm
     $clean = $text.Trim() -replace '：', ':'
@@ -179,18 +126,6 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
     $catchUpText = if ($catchUp) { 'true' } else { 'false' }
     $escapedScript = [System.Security.SecurityElement]::Escape($scriptPath)
     $escapedDir = [System.Security.SecurityElement]::Escape($scriptDir)
-    # 计划任务直接调 node.exe 会闪一下黑窗口；用编译出来的 noymanga-runner.exe 静默启动
-    $escapedNode = [System.Security.SecurityElement]::Escape($node)
-    $runnerPath = $null
-    try { $runnerPath = Ensure-Runner } catch { Write-Warning ("启动器生成失败，将直接调用 node（每晚可能闪一下黑窗口）：" + $_.Exception.Message) }
-    if ($runnerPath) {
-        $commandPath = $runnerPath
-        $launcherArgs = '"{0}" "{1}"' -f $escapedNode, $escapedScript
-    } else {
-        $commandPath = $node
-        $launcherArgs = '"{0}"' -f $escapedScript
-    }
-    $escapedCommand = [System.Security.SecurityElement]::Escape($commandPath)
 
     return @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -235,8 +170,8 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$escapedCommand</Command>
-      <Arguments>$launcherArgs</Arguments>
+      <Command>$([System.Security.SecurityElement]::Escape($node))</Command>
+      <Arguments>"$escapedScript"</Arguments>
       <WorkingDirectory>$escapedDir</WorkingDirectory>
     </Exec>
   </Actions>
@@ -244,22 +179,6 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
 "@
 }
 
-function Get-ResultText($value) {
-    $code = 0
-    if (-not [int]::TryParse(([string]$value).Trim(), [ref]$code)) { return "程序返回了 $value" }
-    switch ($code) {
-        0           { return '成功（0）' }
-        1           { return '脚本本身报错（1）' }
-        2           { return '需要登录（2）' }
-        -1073741510 { return '被强制终止：运行它的控制台窗口被关闭，或按了 Ctrl+C（0xC000013A）' }
-        -1073741819 { return '程序崩溃（0xC0000005）' }
-        -1073741571 { return '栈溢出 / 异常终止（0xC00000FD）' }
-        267009      { return '任务正在运行' }
-        267011      { return '任务还没运行过' }
-        267014      { return '任务被用户终止' }
-        default     { return "未知返回码 $value" }
-    }
-}
 function Show-Status {
     Write-Head 'Noymanga 签到状态'
 
@@ -272,17 +191,10 @@ function Show-Status {
     Write-Host '  计划任务：已安装'
 
     $detail = (Invoke-Schtasks @('/Query', '/TN', $taskName, '/V', '/FO', 'LIST')).Output
-    $lastResult = $null
     foreach ($line in $detail) {
         if ($line -match '^\s*(下次运行时间|上次运行时间|上次结果|状态|要运行的任务|Next Run Time|Last Run Time|Last Result|Status|Task To Run)\s*[:：]\s*(.+)$') {
-            $fieldName = $Matches[1].Trim()
-            $fieldValue = $Matches[2].Trim()
-            Write-Host ('  {0}：{1}' -f $fieldName, $fieldValue)
-            if ($fieldName -match '上次结果|Last Result') { $lastResult = $fieldValue }
+            Write-Host ('  {0}：{1}' -f $Matches[1].Trim(), $Matches[2].Trim())
         }
-    }
-    if ($lastResult) {
-        Write-Host ('  → ' + (Get-ResultText $lastResult)) -ForegroundColor DarkYellow
     }
 
     Write-Host ''
@@ -291,7 +203,6 @@ function Show-Status {
         $label = switch -Wildcard ((Get-Content -LiteralPath $statusFile -Raw)) {
             '*"CHECKED_IN"*'         { '今天已签到（脚本完成的）'; break }
             '*"ALREADY_CHECKED_IN"*' { '今天已经签到过了'; break }
-'*"LOGIN_OK"*'           { '登录成功（还没签到，等定时任务跑）'; break }
             '*"LOGIN_TIMEOUT"*'      { '需要重新登录（上次登录超时）'; break }
             '*"LOGIN_REQUIRED"*'     { '需要重新登录'; break }
             '*"CHECKIN_FAILED"*'     { '签到请求失败'; break }
@@ -333,13 +244,7 @@ $protocolScheme = 'noymanga'
 function Register-LoginProtocol([string]$nodePath, [string]$targetScript) {
     $root = "HKCU:\Software\Classes\$protocolScheme"
     $commandKey = Join-Path $root 'shell\open\command'
-    $runnerPath = $null
-    try { $runnerPath = Ensure-Runner } catch { $runnerPath = $null }
-    if ($runnerPath) {
-        $command = '"{0}" "{1}" "{2}" --login' -f $runnerPath, $nodePath, $targetScript
-    } else {
-        $command = '"{0}" "{1}" --login' -f $nodePath, $targetScript
-    }
+    $command = '"{0}" "{1}" --login' -f $nodePath, $targetScript
     New-Item -Path $root -Force | Out-Null
     Set-ItemProperty -Path $root -Name '(default)' -Value 'URL:Noymanga Auto Check-in Login'
     New-ItemProperty -Path $root -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
@@ -372,35 +277,6 @@ function Invoke-Login([string]$nodePath) {
 }
 
 # ---------------------------------------------------------------
-# 只取消自动签到（删任务，保留脚本 / 登录态 / 日志）
-# ---------------------------------------------------------------
-if ($RemoveTask) {
-    Write-Head '取消每日自动签到'
-    Write-Host '  将删除计划任务「Noymanga Daily Check-in」。'
-    Write-Host '  脚本文件、登录态（browser-profile）和日志都会保留。'
-    Write-Host ''
-    if (-not $Quiet) {
-        $answer = Read-Host '  确认取消自动签到吗？输入 y 确认，直接回车退出 [y/N]'
-        if (($answer -as [string]).Trim().ToLower() -notin @('y', 'yes')) {
-            Write-Host '  已取消，什么都没改。' -ForegroundColor Yellow
-            Read-Host '  按回车键关闭' | Out-Null
-            return
-        }
-    }
-    $removed = Invoke-Schtasks @('/Delete', '/TN', $taskName, '/F')
-    if ($removed.Code -eq 0) {
-        Write-Host '  计划任务已删除，以后不会再自动签到了。' -ForegroundColor Green
-    } else {
-        Write-Host '  计划任务本来就不存在（可能之前已经取消过）。' -ForegroundColor Yellow
-    }
-    Write-Host ''
-    Write-Host '  想恢复自动签到：双击「安装.bat」，按提示重来一遍即可（登录态还在，不用重新登录）。'
-    Write-Host '  想手动立刻签一次：node .\noymanga-auto-checkin-v2.js'
-    if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
-    return
-}
-
-# ---------------------------------------------------------------
 # 卸载
 # ---------------------------------------------------------------
 if ($Uninstall) {
@@ -413,11 +289,6 @@ if ($Uninstall) {
     }
     Unregister-LoginProtocol
     Write-Host '  通知点击用的 noymanga:// 协议已移除。' -ForegroundColor Green
-    $helperInstaller = Join-Path $PSScriptRoot 'install-helper.ps1'
-    if (Test-Path -LiteralPath $helperInstaller) {
-        & $helperInstaller -Uninstall -Quiet | Out-Null
-        Write-Host '  通知助手已移除。' -ForegroundColor Green
-    }
     Write-Host ''
     Write-Host '  登录态、日志、脚本文件都还在，需要的话可以手动删除整个文件夹。'
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
@@ -447,8 +318,6 @@ if ($Login) {
 # 安装 / 修改
 # ---------------------------------------------------------------
 Write-Head 'Noymanga 每日自动签到 · 安装向导'
-Write-Host '  提示：直接双击即可；创建计划任务时会自动弹出一次 UAC，点「是」。' -ForegroundColor DarkGray
-Write-Host '        （创建的是「只在你登录时运行」的个人任务，写的是你自己的注册表项。）' -ForegroundColor DarkGray
 
 if (-not (Test-Path -LiteralPath $scriptPath)) {
     Write-Host "  找不到脚本：$scriptPath" -ForegroundColor Red
@@ -532,8 +401,7 @@ if ($createCode -ne 0) {
     Write-Host '  创建计划任务失败：' -ForegroundColor Red
     $result | ForEach-Object { Write-Host "    $_" }
     Write-Host ''
-    Write-Host '  常见原因：这台电脑的策略不允许普通权限创建计划任务。' -ForegroundColor Yellow
-    Write-Host '  解决办法：右键「安装.bat」→ 以管理员身份运行。' -ForegroundColor Yellow
+    Write-Host '  常见原因：当前账户不允许创建任务。请右键「安装.bat」→ 以管理员身份运行，再试一次。' -ForegroundColor Yellow
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
     exit 1
 }

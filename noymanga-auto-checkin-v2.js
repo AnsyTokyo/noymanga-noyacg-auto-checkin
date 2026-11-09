@@ -53,9 +53,7 @@ const DEFAULT_CONFIG = {
   notify: true,                              // 是否弹 Windows 通知
   notifyAction: true,                        // 需要登录的通知可点击（点了直接打开登录窗口）
   protocolScheme: "noymanga",                // 通知点击用的自定义协议，由安装脚本注册
-  notifyWaitMs: 12_000,                      // 等通知真正弹出来再退出（计划任务会回收子进程）
-  notifyAlready: true,                       // 今天已经签过了也弹一条，方便确认任务跑过
-  notifyHelper: true,                        // 优先交给桌面助手弹通知（计划任务自己弹不出来）
+  notifyWaitMs: 12_000,                      // 等通知弹出来的上限
   loginTimeoutSeconds: 120,                  // 需要登录时，给你多久时间登录
   startTimeoutMs: 35_000,                    // 等待浏览器开放调试端口的上限
   pollIntervalMs: 500,                       // 轮询间隔
@@ -89,67 +87,20 @@ const CONFIG = loadConfig();
 const PROFILE_DIR = path.join(ROOT, CONFIG.profileDirName);
 const LOG_DIR = path.join(ROOT, "logs");
 const STATUS_FILE = path.join(ROOT, "status.txt");
-const HELPER_PID_FILE = path.join(LOG_DIR, "notify-helper.pid");
-const NOTIFY_QUEUE_FILE = path.join(LOG_DIR, "notify-queue.log");
 
 // 通知被点击 / 网页调用 noymanga://login 时，可能短时间内触发多次。
 // 用一个标记文件做节流，避免一下子弹出好几个登录窗口。
 const LOGIN_TRIGGER_FILE = path.join(LOG_DIR, ".login-trigger");
 const LOGIN_TRIGGER_COOLDOWN_MS = 10_000;
 
-// 同一时间只允许一个实例。安装向导里的「立即运行一次」很容易和定时任务撞车，
-// 两个进程抢同一个浏览器配置目录，页面就会直接崩溃（Target crashed）。
-const LOCK_FILE = path.join(LOG_DIR, ".lock");
-const LOCK_STALE_MS = 10 * 60_000;
-
-function processAlive(pid) {
-  if (!pid || !Number.isFinite(pid)) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-function acquireLock() {
-  try {
-    if (fs.existsSync(LOCK_FILE)) {
-      const stale = Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS;
-      const owner = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
-      if (!stale && processAlive(owner)) return false;
-    }
-    fs.writeFileSync(LOCK_FILE, String(process.pid), "utf8");
-    return true;
-  } catch (_) {
-    return true; // 锁只是防呆，出错不能反过来挡住签到
-  }
-}
-
-function releaseLock() {
-  try {
-    if (
-      fs.existsSync(LOCK_FILE) &&
-      fs.readFileSync(LOCK_FILE, "utf8").trim() === String(process.pid)
-    ) {
-      fs.unlinkSync(LOCK_FILE);
-    }
-  } catch (_) {
-    /* 忽略 */
-  }
-}
-
 const ARGS = new Set(process.argv.slice(2));
 const DRY_RUN = ARGS.has("--dry-run");
 const LOGIN_ONLY = ARGS.has("--login");
 const NOTIFY_TEST = ARGS.has("--notify-test");
 const NOTIFY_ACTION_TEST = ARGS.has("--notify-action-test");
-const CLEANUP_ONLY = ARGS.has("--cleanup");
 // 命令行显式指定的模式优先于 config.json
 const FORCE_HEADLESS = ARGS.has("--headless");
 const FORCE_HEADED = ARGS.has("--headed");
-// 第一次启动崩溃后，重试时追加的保守参数（沙箱/渲染进程在部分机器上会被拦）
-const EXTRA_FLAGS = [];
 
 const LOGIN_TIMEOUT_MS = Math.max(15, Number(CONFIG.loginTimeoutSeconds) || 120) * 1000;
 
@@ -231,6 +182,13 @@ function cleanupOldLogs() {
 const POWERSHELL_APP_ID =
   "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
 
+/**
+ * 安装脚本会给本程序注册一个自己的应用身份（AppUserModelID）。
+ * 借用 PowerShell 的身份在计划任务里会报 0x80073D54「该进程没有程序包标识符」，
+ * 所以优先用自己的，失败再退回 PowerShell 的（控制台里那条是能用的）。
+ */
+const TOAST_APP_ID = "Noymanga.AutoCheckin";
+
 function escapeXml(text) {
   return String(text)
     .replace(/&/g, "&amp;")
@@ -254,12 +212,14 @@ function isProtocolRegistered() {
  * 构造一段弹 Toast 的 PowerShell 脚本。
  * actionUrl 非空时，整条通知变成可点击：点击由系统按协议打开 actionUrl。
  */
-function toastScript(title, message, seconds = 8, actionUrl = null) {
+function toastScript(title, message, seconds = 8, actionUrl = null, appId = POWERSHELL_APP_ID) {
   const toastAttrs = actionUrl
     ? ` activationType="protocol" launch="${escapeXml(actionUrl)}" duration="long"`
     : "";
   return `
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] > $null
 $xml = @'
@@ -268,8 +228,13 @@ $xml = @'
 $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
 $doc.LoadXml($xml)
 $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
-$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${POWERSHELL_APP_ID}')
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${appId}')
 $notifier.Show($toast)
+  [Console]::Out.WriteLine('TOAST OK')
+} catch {
+  $win = (Get-Process -Id $PID).MainWindowHandle
+  [Console]::Out.WriteLine('TOAST ERR win=' + $win + ' ' + $_.Exception.Message)
+}
 Start-Sleep -Seconds ${Math.max(1, Math.round(seconds))}
 `.trim();
 }
@@ -295,62 +260,49 @@ function runPowerShell(script, timeoutMs = 15_000) {
  * 弹一条 Windows 通知；失败只记日志，不影响签到。
  * options.action === true 时，通知可点击 → 打开登录窗口（需要协议已注册）。
  */
-/** 通知助手还活着就返回它的 pid，否则返回 0。 */
-function notifyHelperPid() {
-  try {
-    const raw = fs.readFileSync(HELPER_PID_FILE, "utf8").trim();
-    const pid = Number(raw);
-    if (!Number.isInteger(pid) || pid <= 0) return 0;
-    process.kill(pid, 0); // 只是探活，不会真的杀进程
-    return pid;
-  } catch (_) {
-    return 0;
-  }
-}
-
-/** 把要弹的内容写进队列，交给桌面会话里的助手去弹。 */
-function queueNotification(title, message) {
-  try {
-    fs.appendFileSync(NOTIFY_QUEUE_FILE, `${title}|${message}\n`, "utf8");
-    return true;
-  } catch (error) {
-    log(`Unable to queue the notification: ${error.message}`, "WARN");
-    return false;
-  }
-}
 function notify(title, message, options = {}) {
   if (!CONFIG.notify || DRY_RUN) return;
   const wantAction = options.action === true && CONFIG.notifyAction !== false;
   const actionUrl = wantAction && isProtocolRegistered() ? loginProtocolUrl() : null;
   if (wantAction && !actionUrl) log("Notification action skipped: protocol handler not installed.", "WARN");
-  // 计划任务里的进程弹不出通知，交给桌面会话里的助手代发
-  if (CONFIG.notifyHelper !== false && notifyHelperPid() > 0 && queueNotification(title, message)) {
-    log("Notification handed to the desktop helper.");
-    return;
-  }
-  const script = toastScript(title, message, 3, actionUrl);
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
-  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded];
-  // 必须等 PowerShell 把通知交给系统之后再返回：
-  // 计划任务在 node 退出时会回收整棵进程树，纯分离的子进程可能还没弹窗就被杀掉。
-  try {
-    execFileSync("powershell.exe", args, {
-      stdio: "ignore",
-      windowsHide: true,
-      timeout: CONFIG.notifyWaitMs,
-    });
-    log("Notification shown.");
-  } catch (error) {
-    if (error.code === "ETIMEDOUT") {
-      log("Notification did not finish in time; gave up waiting.", "WARN");
+  // 先用自己的应用身份；没注册或失败时退回 PowerShell 的身份（控制台能用，任务里不行）。
+  let lastError = "";
+  for (const appId of [TOAST_APP_ID, POWERSHELL_APP_ID]) {
+    const result = showToast(appId, title, message, actionUrl);
+    if (result.ok) {
+      log("Notification shown.");
       return;
     }
-    log(`Notification wait failed (${error.message}); falling back to a detached process.`, "WARN");
-    try {
-      spawn("powershell.exe", args, { stdio: "ignore", windowsHide: true, detached: true }).unref();
-    } catch (_) {
-      /* 通知是尽力而为，失败不影响签到 */
+    lastError = result.message;
+    if (/0x80073D54|no package identity/i.test(lastError) && appId === TOAST_APP_ID) {
+      log("Own app identity is not registered yet; falling back to PowerShell's.", "WARN");
+      continue;
     }
+    break;
+  }
+  log(`Notification failed: ${lastError}`, "WARN");
+}
+
+/** 真正调用一次 PowerShell 弹通知，返回 { ok, message }。 */
+function showToast(appId, title, message, actionUrl) {
+  const script = toastScript(title, message, 3, actionUrl, appId);
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  // 同步等待：脚本一退出，这个弹窗子进程会被一起带走，所以必须等它真正弹出来
+  try {
+    const out = execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      { encoding: "utf8", timeout: CONFIG.notifyWaitMs, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const text = String(out || "").trim();
+    const at = text.indexOf("TOAST ERR");
+    if (at !== -1) return { ok: false, message: text.slice(at + "TOAST ERR".length).trim() };
+    return { ok: true, message: "" };
+  } catch (error) {
+    const partial = String((error && error.stdout) || "").trim();
+    const at = partial.indexOf("TOAST ERR");
+    if (at !== -1) return { ok: false, message: partial.slice(at + "TOAST ERR".length).trim() };
+    return { ok: false, message: String((error && error.message) || error) };
   }
 }
 
@@ -573,56 +525,6 @@ function getJson(url) {
   });
 }
 
-/** 取浏览器级别的 WebSocket 地址（/json/version），浏览器级命令要从这里发。 */
-async function getBrowserWsUrl() {
-  try {
-    const info = await getJson(`http://127.0.0.1:${CONFIG.debugPort}/json/version`);
-    return info && info.webSocketDebuggerUrl ? info.webSocketDebuggerUrl : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-/** 按调试端口的监听者反查浏览器主进程 pid（spawn 拿到的可能是启动器壳进程）。 */
-function findPidByPort(port) {
-  try {
-    const output = execFileSync("netstat.exe", ["-ano", "-p", "tcp"], {
-      encoding: "utf8",
-      windowsHide: true,
-    });
-    for (const line of output.split(/\r?\n/)) {
-      if (!line.includes(`:${port}`)) continue;
-      if (!/LISTENING/i.test(line)) continue;
-      const parts = line.trim().split(/\s+/);
-      const pid = Number(parts[parts.length - 1]);
-      if (Number.isFinite(pid) && pid > 0) return pid;
-    }
-  } catch (_) {
-    /* netstat 不可用就算了 */
-  }
-  return 0;
-}
-
-/** 按 pid 强杀整棵进程树（浏览器不响应关闭请求时的最后手段）。 */
-function killProcessTree(pid) {
-  if (!pid) return false;
-  try {
-    const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    killer.unref();
-    return true;
-  } catch (_) {
-    try {
-      process.kill(pid);
-      return true;
-    } catch (_error) {
-      return false;
-    }
-  }
-}
-
 /** 探测一次调试端口，拿到当前可用的页面目标；没有则返回 null。 */
 async function probeTarget() {
   try {
@@ -705,79 +607,24 @@ async function evaluate(cdp, expression) {
   return result.result.value;
 }
 
-/**
- * 关掉浏览器，并且**确认它真的退出了**。
- *
- * 注意：Browser.close 属于浏览器级命令，从「页面会话」发往往被忽略
- * （这就是以前登录成功后窗口关不掉的原因），所以这里优先从
- * /json/version 的浏览器级 WebSocket 发；5 秒还没退出就按 pid 强杀进程树。
- */
-// 上一次运行如果崩在半路，会留下还在跑、但已经没用的浏览器进程：
-// 它们占着配置目录，还会让计划任务一直显示「正在运行」，新的运行直接被拒。
-// 这里按命令行里的配置目录路径把它们找出来清掉。
-function killStaleBrowsers() {
-  let killed = 0;
+/** 用 CDP 优雅关闭浏览器（让 Cookie 等数据刷盘）。 */
+async function closeBrowser(cdp) {
   try {
-    const script = [
-      "Get-CimInstance Win32_Process",
-      `Where-Object { $_.CommandLine -like '*${PROFILE_DIR}*' -and $_.Name -match '^(msedge|chrome)' }`,
-      "ForEach-Object { $_.ProcessId }",
-    ].join(" | ");
-    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 20_000,
-    });
-    for (const line of out.split(/\r?\n/)) {
-      const pid = Number(line.trim());
-      if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) {
-        log(`Terminating stale browser process pid ${pid}.`, "WARN");
-        killProcessTree(pid);
-        killed += 1;
-      }
-    }
+    await cdp.send("Browser.close");
   } catch (_) {
-    /* 查不到就算了，不能因为清理失败挡住签到 */
+    /* 可能已经关闭 */
   }
-  return killed;
+}
+/** 关不掉时按进程号强制结束整棵进程树（Windows 专用）。 */
+function killProcessTree(pid) {
+  if (!pid) return;
+  try {
+    execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+  } catch (_) {
+    /* 进程可能已经退出 */
+  }
 }
 
-async function shutdownBrowser({ cdp = null, pid = 0, label = "Browser" } = {}) {
-  // ① 页面会话里也发一次（老版本浏览器认这个）
-  if (cdp) {
-    try {
-      await cdp.send("Browser.close");
-    } catch (_) {
-      /* 已经关了也没关系 */
-    }
-  }
-
-  // ② 浏览器级会话是正主
-  const browserWs = await getBrowserWsUrl();
-  if (browserWs) {
-    try {
-      const browserCdp = connectCdp(browserWs);
-      await browserCdp.opened;
-      await browserCdp.send("Browser.close");
-      browserCdp.close();
-    } catch (_) {
-      /* 忽略：下面还有兜底 */
-    }
-  }
-
-  if (await waitForPortClosed(5_000)) return true;
-
-  // ③ 兜底：按「端口占用者」和「spawn 得到的 pid」强杀整棵进程树
-  const portPid = findPidByPort(CONFIG.debugPort);
-  const targets = [...new Set([portPid, pid].filter(Boolean))];
-  for (const target of targets) {
-    log(`${label} ignored the close request; terminating pid ${target}.`, "WARN");
-    killProcessTree(target);
-  }
-  if (targets.length && (await waitForPortClosed(5_000))) return true;
-  log(`${label} is still running after the close request.`, "WARN");
-  return false;
-}
 
 /* ============================================================
  * 六、启动 / 关闭浏览器
@@ -796,24 +643,16 @@ async function launchBrowser(headless, startUrl) {
       "--no-default-browser-check",
     ];
     if (headless) {
-      args.push("--headless=new", "--hide-scrollbars", "--mute-audio", "--disable-gpu");
-      // 这台机器上不加下面这几项，首次启动的渲染进程会在 8 秒左右崩掉（Target crashed）。
-      // 加了之后 3~4 秒就能加载完，所以直接作为默认值。
-      args.push("--no-sandbox", "--disable-dev-shm-usage", "--disable-features=RendererCodeIntegrity");
+      args.push("--headless=new", "--hide-scrollbars", "--mute-audio");
+      // 无窗口模式没有真实显示输出，走 GPU 栈容易崩（这台机器上半分钟就 Target crashed）。
+      // 这三个参数是 Chromium 无头模式的标准兜底组合。
+      args.push("--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage");
     }
-    if (EXTRA_FLAGS.length) args.push(...EXTRA_FLAGS);
     args.push(startUrl);
 
     let child;
     try {
-      const stderrPath = path.join(LOG_DIR, "browser-stderr.log");
-      const stderrFd = fs.openSync(stderrPath, "a");
-      child = spawn(browser.exe, args, { detached: false, stdio: ["ignore", "ignore", stderrFd] });
-      try {
-        fs.closeSync(stderrFd);
-      } catch (_) {
-        /* 忽略 */
-      }
+      child = spawn(browser.exe, args, { detached: false, stdio: "ignore" });
       child.unref();
     } catch (error) {
       log(`Failed to spawn ${browser.name}: ${error.message}`, "WARN");
@@ -821,14 +660,13 @@ async function launchBrowser(headless, startUrl) {
     }
 
     const target = await waitForTarget(CONFIG.startTimeoutMs);
-    if (target) return { target, browser, pid: child.pid || 0 };
+    if (target) return { target, browser, pid: child.pid };
     log(`${browser.name} did not open the debug port in time; trying the next one.`, "WARN");
     try {
       child.kill();
     } catch (_) {
       /* 忽略 */
     }
-    killProcessTree(child.pid);
     await delay(1_000);
   }
   return null;
@@ -838,40 +676,10 @@ async function launchBrowser(headless, startUrl) {
  * 打开浏览器 → 连上 → 执行 fn(cdp) → 关掉浏览器。
  * headless 启动失败时自动回退到有窗口模式（有些机器/杀软会拦 headless）。
  */
-// 端口上挂着的目标未必还活着：上一个进程刚被杀掉时，端口可能还开着几秒，
-// 这时候去「复用」只会得到一串超时。先 ping 一下再决定。
-async function pingTarget(target) {
-  const cdp = connectCdp(target.webSocketDebuggerUrl);
-  try {
-    await Promise.race([
-      cdp.opened,
-      new Promise((resolve, reject) => setTimeout(() => reject(new Error("connect timeout")), 4_000)),
-    ]);
-    await cdp.send("Runtime.evaluate", { expression: "1+1", returnByValue: true });
-    return true;
-  } catch (_) {
-    return false;
-  } finally {
-    try {
-      cdp.close();
-    } catch (_) {
-      /* 忽略 */
-    }
-  }
-}
-
 async function withBrowser(headless, startUrl, fn) {
   // 上一次运行残留的会话直接复用，避免重复启动
   let target = await probeTarget();
-  if (target && !(await pingTarget(target))) {
-    log("A stale debugging target was found but does not respond; discarding it.", "WARN");
-    target = null;
-    // 端口上还挂着不响应的监听者时直接启动，新的浏览器会接管失败、连上旧端口 → 超时。
-    killStaleBrowsers();
-    await waitForPortClosed(8_000);
-  }
   let usedHeadless = headless;
-  let childPid = 0;
   if (target) {
     log("An existing browser debug session is still open; reusing it.");
   } else {
@@ -886,7 +694,6 @@ async function withBrowser(headless, startUrl, fn) {
       fail("None of the browsers opened a debug port in time. Close leftover browser windows and retry.");
     }
     target = launched.target;
-    childPid = launched.pid || 0;
   }
 
   const cdp = connectCdp(target.webSocketDebuggerUrl);
@@ -897,9 +704,9 @@ async function withBrowser(headless, startUrl, fn) {
   try {
     return await fn(cdp, usedHeadless);
   } finally {
-    // 关不掉就强杀，避免把窗口/进程留在后台
-    await shutdownBrowser({ cdp, pid: childPid });
+    await closeBrowser(cdp);
     cdp.close();
+    await waitForPortClosed(10_000);
   }
 }
 
@@ -1027,9 +834,16 @@ async function loginFlow() {
   // 1) 先确保没有同 profile 的实例占着（Chrome 的 profile 是独占的）
   const existing = await probeTarget();
   if (existing) {
-    await shutdownBrowser({ label: "Leftover browser instance" });
-    await waitForPortClosed(5_000);
+    try {
+      const cdp = connectCdp(existing.webSocketDebuggerUrl);
+      await cdp.opened;
+      await closeBrowser(cdp);
+      cdp.close();
+    } catch (_) {
+      /* 忽略 */
+    }
   }
+  await waitForPortClosed(10_000);
 
   // 2) 有窗口启动，直接落在登录页
   const launched = await launchBrowser(false, CONFIG.loginUrl);
@@ -1060,11 +874,8 @@ async function loginFlow() {
         await delay(1_000);
         continue;
       }
-      // 登录成功的判定：只要离开了登录页、页面上也不再显示登录入口，就算登录好了。
-      // （实测站点登录后可能跳回首页 "/" 而不是 "/user"，所以不能只认 /user。）
-      const onLoginPage = /\/login(\?|#|$)/i.test(quick.url);
-      if (!quick.login && !onLoginPage && /noymanga\.com/i.test(quick.url)) {
-        log(`Login detected on ${quick.url}; continuing.`);
+      if (!quick.login && !/\/login(\?|#|$)/i.test(quick.url) && /noymanga\.com/i.test(quick.url)) {
+        log("Login detected; continuing.");
         await delay(1_000);
         return true;
       }
@@ -1074,10 +885,14 @@ async function loginFlow() {
     else log(`Login timed out after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s.`, "WARN");
     return false;
   } finally {
-    // 无论成功失败都关掉，绝不留僵尸窗口（关不掉就强杀）
-    const closed = await shutdownBrowser({ cdp, pid: launched.pid || 0, label: "Login window" });
-    if (closed) log("Login window closed.");
+    // 无论成功失败都关掉，绝不留僵尸窗口
+    await closeBrowser(cdp);
     cdp.close();
+    if (!(await waitForPortClosed(10_000))) {
+      log("The login window did not close in time; terminating it.", "WARN");
+      killProcessTree(launched.pid);
+      await waitForPortClosed(5_000);
+    }
   }
 }
 
@@ -1100,9 +915,7 @@ async function doCheckin(cdp, state) {
   if (state.already) {
     log("Already checked in today. Nothing to do.");
     writeStatus("ALREADY_CHECKED_IN", "already checked in today");
-    if (CONFIG.notifyAlready !== false) {
-      notify("Noymanga 今天已签到", "今天已经签过了，不需要重复签到。");
-    }
+    notify("Noymanga 今日已签到", "今天已经签过到了，无需重复签到。");
     return "ALREADY_CHECKED_IN";
   }
 
@@ -1143,14 +956,50 @@ async function doCheckin(cdp, state) {
   if (!already) {
     const suffix = continuous !== null ? `已连续签到 ${continuous} 天。` : "今天的签到已完成。";
     notify("Noymanga 签到成功", suffix);
-  } else if (CONFIG.notifyAlready !== false) {
-    notify("Noymanga 今天已签到", "服务器说今天已经签过了，无需重复签到。");
+  } else {
+    notify("Noymanga 今日已签到", "今天已经签过到了，无需重复签到。");
   }
   return stateName;
 }
 
+/** 杀掉命令行里带着本脚本配置目录的残留浏览器（上次崩溃/被强杀留下的孤儿进程）。 */
+function killStaleBrowsers() {
+  if (process.platform !== "win32" || DRY_RUN) return;
+  const target = "'" + PROFILE_DIR.replace(/'/g, "''") + "'";
+  // 不用 -Filter（里面的引号会被多重解析吃掉），改用管道过滤。
+  const script = [
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+    `$target = ${target}`,
+    "$killed = @()",
+    "try {",
+    "  Get-CimInstance Win32_Process -ErrorAction Stop |",
+    "    Where-Object { ($_.Name -eq 'msedge.exe' -or $_.Name -eq 'chrome.exe') -and $_.CommandLine -and $_.CommandLine.Contains($target) } |",
+    "    ForEach-Object {",
+    "      $killed += $_.ProcessId",
+    "      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
+    "    }",
+    "} catch { }",
+    "if ($killed.Count -gt 0) { 'KILLED ' + ($killed -join ',') }",
+    "exit 0",
+  ].join("\n");
+  try {
+    const out = execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { encoding: "utf8", windowsHide: true, timeout: 25_000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const match = String(out).match(/KILLED\s+([\d,\s]+)/);
+    if (match) {
+      const pids = match[1].split(",").map((item) => item.trim()).filter(Boolean);
+      log(`Closed ${pids.length} stale browser process(es): ${pids.join(", ")}`);
+    }
+  } catch (error) {
+    log(`Stale browser cleanup skipped: ${error.message}`, "WARN");
+  }
+}
 async function main() {
   cleanupOldLogs();
+  killStaleBrowsers();
 
   if (NOTIFY_ACTION_TEST) {
     if (!CONFIG.notify) {
@@ -1217,10 +1066,6 @@ async function main() {
     markLoginTriggered();
     log("Login-only mode: a browser window will open on the login page.");
     const ok = await loginFlow();
-    // 兜底：退出前再确认一次，别把窗口留在桌面上
-    if (await probeTarget()) {
-      await shutdownBrowser({ label: "Login browser" });
-    }
     if (ok) {
       log("Login saved. Future runs will reuse it.");
       writeStatus("LOGIN_OK", "login completed");
@@ -1234,68 +1079,16 @@ async function main() {
     return 2;
   }
 
-  if (CLEANUP_ONLY) {
-    const killed = killStaleBrowsers();
-    if (killed === 0) {
-      log("No leftover browser processes were found.");
-    } else {
-      log(`Cleaned up ${killed} leftover browser process(es).`);
-    }
-    return 0;
-  }
-
-  // 上一轮崩掉留下的浏览器会占着配置目录，启动前先清一遍
-  const stale = killStaleBrowsers();
-  if (stale > 0) {
-    log(`Cleaned up ${stale} leftover browser process(es) before starting.`);
-    await waitForPortClosed(10_000);
-    await delay(1_500);
-  }
-
-  if (!acquireLock()) {
-    log("Another instance is already running; skipping this run.", "WARN");
-    return 0;
-  }
-
-  const checkinPass = async () => {
-    let result = null;
-    await withBrowser(headless, CONFIG.url, async (cdp) => {
-      const state = await inspectPage(cdp);
-      if (state.login) {
-        result = "LOGIN_REQUIRED";
-        return;
-      }
-      result = await doCheckin(cdp, state);
-    });
-    return result;
-  };
-
   // ① 先跑一趟：已登录就直接签，未登录就记录状态交给下一阶段
   let outcome = null;
-  try {
-    outcome = await checkinPass();
-  } catch (error) {
-    // 页面目标崩溃，多半是上一次运行留下的浏览器没退干净，还占着同一个配置目录。
-    // 清掉残留实例再完整重试一次，比直接把 ERROR 写进状态有用得多。
-    log(`First attempt failed (${error.message}); cleaning up and retrying once.`, "WARN");
-    log(
-      `Environment: session=${process.env.SESSIONNAME || "?"} desktop=${process.env.USERDOMAIN || "?"} temp=${process.env.TEMP || "?"}`,
-      "WARN",
-    );
-    if (!EXTRA_FLAGS.length) {
-      EXTRA_FLAGS.push("--no-sandbox", "--disable-dev-shm-usage", "--disable-features=RendererCodeIntegrity");
-      log(`Retrying with extra browser flags: ${EXTRA_FLAGS.join(" ")}`, "WARN");
+  await withBrowser(headless, CONFIG.url, async (cdp) => {
+    const state = await inspectPage(cdp);
+    if (state.login) {
+      outcome = "LOGIN_REQUIRED";
+      return;
     }
-    try {
-      if (await probeTarget()) await shutdownBrowser({ label: "Crashed browser" });
-      await waitForPortClosed(5_000);
-      killStaleBrowsers();
-    } catch (_) {
-      /* 清理失败也要继续重试 */
-    }
-    await delay(3_000);
-    outcome = await checkinPass();
-  }
+    outcome = await doCheckin(cdp, state);
+  });
 
   // ② 需要登录：切到有窗口模式，给你 2 分钟
   if (outcome === "LOGIN_REQUIRED") {
@@ -1341,21 +1134,8 @@ main()
   .then((code) => {
     if (typeof code === "number") process.exitCode = code;
   })
-  .finally(() => {
-    releaseLock();
-  })
   .catch((error) => {
     log(`ERROR: ${error.message}`, "ERROR");
-    // 浏览器自己的抱怨（渲染进程崩溃等）往往就在 stderr 里，顺手抄进运行日志
-    try {
-      const stderrPath = path.join(LOG_DIR, "browser-stderr.log");
-      if (fs.existsSync(stderrPath)) {
-        const tail = fs.readFileSync(stderrPath, "utf8").trim().split(/\\r?\\n/).slice(-12);
-        for (const line of tail) if (line.trim()) log(`browser: ${line.trim()}`, "ERROR");
-      }
-    } catch (_) {
-      /* 读不到就算了 */
-    }
     writeStatus("ERROR", error.message);
     notify("Noymanga 签到出错", error.message.slice(0, 120));
     process.exitCode = 1;
