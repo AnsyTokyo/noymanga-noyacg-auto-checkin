@@ -764,7 +764,12 @@ async function launchBrowser(headless, startUrl) {
       "--no-first-run",
       "--no-default-browser-check",
     ];
-    if (headless) args.push("--headless=new", "--hide-scrollbars", "--mute-audio", "--disable-gpu");
+    if (headless) {
+      args.push("--headless=new", "--hide-scrollbars", "--mute-audio", "--disable-gpu");
+      // 这台机器上不加下面这几项，首次启动的渲染进程会在 8 秒左右崩掉（Target crashed）。
+      // 加了之后 3~4 秒就能加载完，所以直接作为默认值。
+      args.push("--no-sandbox", "--disable-dev-shm-usage", "--disable-features=RendererCodeIntegrity");
+    }
     if (EXTRA_FLAGS.length) args.push(...EXTRA_FLAGS);
     args.push(startUrl);
 
