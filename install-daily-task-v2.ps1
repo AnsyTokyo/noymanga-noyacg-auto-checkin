@@ -181,6 +181,22 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
 "@
 }
 
+function Get-ResultText($value) {
+    $code = 0
+    if (-not [int]::TryParse(([string]$value).Trim(), [ref]$code)) { return "程序返回了 $value" }
+    switch ($code) {
+        0           { return '成功（0）' }
+        1           { return '脚本本身报错（1）' }
+        2           { return '需要登录（2）' }
+        -1073741510 { return '被强制终止：运行它的控制台窗口被关闭，或按了 Ctrl+C（0xC000013A）' }
+        -1073741819 { return '程序崩溃（0xC0000005）' }
+        -1073741571 { return '栈溢出 / 异常终止（0xC00000FD）' }
+        267009      { return '任务正在运行' }
+        267011      { return '任务还没运行过' }
+        267014      { return '任务被用户终止' }
+        default     { return "未知返回码 $value" }
+    }
+}
 function Show-Status {
     Write-Head 'Noymanga 签到状态'
 
@@ -193,10 +209,17 @@ function Show-Status {
     Write-Host '  计划任务：已安装'
 
     $detail = (Invoke-Schtasks @('/Query', '/TN', $taskName, '/V', '/FO', 'LIST')).Output
+    $lastResult = $null
     foreach ($line in $detail) {
         if ($line -match '^\s*(下次运行时间|上次运行时间|上次结果|状态|要运行的任务|Next Run Time|Last Run Time|Last Result|Status|Task To Run)\s*[:：]\s*(.+)$') {
-            Write-Host ('  {0}：{1}' -f $Matches[1].Trim(), $Matches[2].Trim())
+            $fieldName = $Matches[1].Trim()
+            $fieldValue = $Matches[2].Trim()
+            Write-Host ('  {0}：{1}' -f $fieldName, $fieldValue)
+            if ($fieldName -match '上次结果|Last Result') { $lastResult = $fieldValue }
         }
+    }
+    if ($lastResult) {
+        Write-Host ('  → ' + (Get-ResultText $lastResult)) -ForegroundColor DarkYellow
     }
 
     Write-Host ''
@@ -205,6 +228,7 @@ function Show-Status {
         $label = switch -Wildcard ((Get-Content -LiteralPath $statusFile -Raw)) {
             '*"CHECKED_IN"*'         { '今天已签到（脚本完成的）'; break }
             '*"ALREADY_CHECKED_IN"*' { '今天已经签到过了'; break }
+'*"LOGIN_OK"*'           { '登录成功（还没签到，等定时任务跑）'; break }
             '*"LOGIN_TIMEOUT"*'      { '需要重新登录（上次登录超时）'; break }
             '*"LOGIN_REQUIRED"*'     { '需要重新登录'; break }
             '*"CHECKIN_FAILED"*'     { '签到请求失败'; break }
