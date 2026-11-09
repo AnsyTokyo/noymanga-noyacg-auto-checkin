@@ -1,20 +1,18 @@
-﻿<#
-.SYNOPSIS
-    Noymanga 每日自动签到：安装 / 修改 / 查看 / 卸载。
-
-.DESCRIPTION
-    双击「安装.bat」即可进入交互式安装向导：选择签到时间、是否开机补签、
-    是否现在就登录一次。装完会在 Windows 任务计划程序里创建
-    「Noymanga Daily Check-in」每天定时运行。
-
-.EXAMPLE
-    .\install-daily-task-v2.ps1                  # 交互式向导
-    .\install-daily-task-v2.ps1 -Time 08:30      # 直接指定签到时间
-    .\install-daily-task-v2.ps1 -Time 07:15 -NoCatchUp
-    .\install-daily-task-v2.ps1 -Status          # 查看最近一次结果
-    .\install-daily-task-v2.ps1 -Login           # 只是重新登录
-    .\install-daily-task-v2.ps1 -Uninstall       # 删除计划任务
-#>
+﻿# .SYNOPSIS
+# Noymanga 每日自动签到：安装 / 修改 / 查看 / 卸载。
+#
+# .DESCRIPTION
+# 双击「安装.bat」即可进入交互式安装向导：选择签到时间、是否开机补签、
+# 是否现在就登录一次。装完会在 Windows 任务计划程序里创建
+# 「Noymanga Daily Check-in」每天定时运行。
+#
+# .EXAMPLE
+# .\install-daily-task-v2.ps1                  # 交互式向导
+# .\install-daily-task-v2.ps1 -Time 08:30      # 直接指定签到时间
+# .\install-daily-task-v2.ps1 -Time 07:15 -NoCatchUp
+# .\install-daily-task-v2.ps1 -Status          # 查看最近一次结果
+# .\install-daily-task-v2.ps1 -Login           # 只是重新登录
+# .\install-daily-task-v2.ps1 -Uninstall       # 删除计划任务
 [CmdletBinding()]
 param(
     [string]$Time,
@@ -147,7 +145,7 @@ function Get-TaskXml([string]$startTime, [bool]$catchUp) {
 function Show-Status {
     Write-Head 'Noymanga 签到状态'
 
-    $existing = Invoke-Schtasks @('Query', '/TN', $taskName)
+    $existing = Invoke-Schtasks @('/Query', '/TN', $taskName)
     if ($existing.Code -ne 0) {
         Write-Host '  计划任务：未安装' -ForegroundColor Yellow
         Write-Host '  运行「安装.bat」即可创建。'
@@ -155,7 +153,7 @@ function Show-Status {
     }
     Write-Host '  计划任务：已安装'
 
-    $detail = (Invoke-Schtasks @('Query', '/TN', $taskName, '/V', '/FO', 'LIST')).Output
+    $detail = (Invoke-Schtasks @('/Query', '/TN', $taskName, '/V', '/FO', 'LIST')).Output
     foreach ($line in $detail) {
         if ($line -match '^\s*(下次运行时间|上次运行时间|上次结果|状态|要运行的任务|Next Run Time|Last Run Time|Last Result|Status|Task To Run)\s*[:：]\s*(.+)$') {
             Write-Host ('  {0}：{1}' -f $Matches[1].Trim(), $Matches[2].Trim())
@@ -246,7 +244,7 @@ function Invoke-Login([string]$nodePath) {
 # ---------------------------------------------------------------
 if ($Uninstall) {
     Write-Head '卸载 Noymanga 自动签到'
-    $deleted = Invoke-Schtasks @('Delete', '/TN', $taskName, '/F')
+    $deleted = Invoke-Schtasks @('/Delete', '/TN', $taskName, '/F')
     if ($deleted.Code -eq 0) {
         Write-Host '  计划任务已删除。' -ForegroundColor Green
     } else {
@@ -300,9 +298,9 @@ Write-Host ("  Node.js：{0}  ({1})" -f $node, (& $node -v))
 
 # 1) 签到时间
 $existingTask = $null
-$probe = Invoke-Schtasks @('Query', '/TN', $taskName)
+$probe = Invoke-Schtasks @('/Query', '/TN', $taskName)
 if ($probe.Code -eq 0) {
-    $existingTask = ((Invoke-Schtasks @('Query', '/TN', $taskName, '/V', '/FO', 'LIST')).Output) -join "`n"
+    $existingTask = ((Invoke-Schtasks @('/Query', '/TN', $taskName, '/V', '/FO', 'LIST')).Output) -join "`n"
 }
 
 $startTime = $null
@@ -355,7 +353,7 @@ $xmlPath = Join-Path ([System.IO.Path]::GetTempPath()) ("noymanga-task-{0}.xml" 
 [System.IO.File]::WriteAllText($xmlPath, $xml, [System.Text.Encoding]::Unicode)
 
 try {
-    $created = Invoke-Schtasks @('Create', '/TN', $taskName, '/XML', $xmlPath, '/F')
+    $created = Invoke-Schtasks @('/Create', '/TN', $taskName, '/XML', $xmlPath, '/F')
     $result = $created.Output
     $createCode = $created.Code
 } finally {
