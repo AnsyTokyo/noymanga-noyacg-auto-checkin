@@ -145,6 +145,8 @@ const CLEANUP_ONLY = ARGS.has("--cleanup");
 // 命令行显式指定的模式优先于 config.json
 const FORCE_HEADLESS = ARGS.has("--headless");
 const FORCE_HEADED = ARGS.has("--headed");
+// 第一次启动崩溃后，重试时追加的保守参数（沙箱/渲染进程在部分机器上会被拦）
+const EXTRA_FLAGS = [];
 
 const LOGIN_TIMEOUT_MS = Math.max(15, Number(CONFIG.loginTimeoutSeconds) || 120) * 1000;
 
@@ -763,11 +765,19 @@ async function launchBrowser(headless, startUrl) {
       "--no-default-browser-check",
     ];
     if (headless) args.push("--headless=new", "--hide-scrollbars", "--mute-audio", "--disable-gpu");
+    if (EXTRA_FLAGS.length) args.push(...EXTRA_FLAGS);
     args.push(startUrl);
 
     let child;
     try {
-      child = spawn(browser.exe, args, { detached: false, stdio: "ignore" });
+      const stderrPath = path.join(LOG_DIR, "browser-stderr.log");
+      const stderrFd = fs.openSync(stderrPath, "a");
+      child = spawn(browser.exe, args, { detached: false, stdio: ["ignore", "ignore", stderrFd] });
+      try {
+        fs.closeSync(stderrFd);
+      } catch (_) {
+        /* 忽略 */
+      }
       child.unref();
     } catch (error) {
       log(`Failed to spawn ${browser.name}: ${error.message}`, "WARN");
@@ -1232,6 +1242,14 @@ async function main() {
     // 页面目标崩溃，多半是上一次运行留下的浏览器没退干净，还占着同一个配置目录。
     // 清掉残留实例再完整重试一次，比直接把 ERROR 写进状态有用得多。
     log(`First attempt failed (${error.message}); cleaning up and retrying once.`, "WARN");
+    log(
+      `Environment: session=${process.env.SESSIONNAME || "?"} desktop=${process.env.USERDOMAIN || "?"} temp=${process.env.TEMP || "?"}`,
+      "WARN",
+    );
+    if (!EXTRA_FLAGS.length) {
+      EXTRA_FLAGS.push("--no-sandbox", "--disable-dev-shm-usage", "--disable-features=RendererCodeIntegrity");
+      log(`Retrying with extra browser flags: ${EXTRA_FLAGS.join(" ")}`, "WARN");
+    }
     try {
       if (await probeTarget()) await shutdownBrowser({ label: "Crashed browser" });
       await waitForPortClosed(5_000);
