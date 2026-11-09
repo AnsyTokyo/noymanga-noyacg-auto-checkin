@@ -413,6 +413,11 @@ if ($Uninstall) {
     }
     Unregister-LoginProtocol
     Write-Host '  通知点击用的 noymanga:// 协议已移除。' -ForegroundColor Green
+    $helperInstaller = Join-Path $PSScriptRoot 'install-helper.ps1'
+    if (Test-Path -LiteralPath $helperInstaller) {
+        & $helperInstaller -Uninstall -Quiet | Out-Null
+        Write-Host '  通知助手已移除。' -ForegroundColor Green
+    }
     Write-Host ''
     Write-Host '  登录态、日志、脚本文件都还在，需要的话可以手动删除整个文件夹。'
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }

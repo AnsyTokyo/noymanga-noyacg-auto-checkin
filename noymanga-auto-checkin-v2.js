@@ -55,6 +55,7 @@ const DEFAULT_CONFIG = {
   protocolScheme: "noymanga",                // 通知点击用的自定义协议，由安装脚本注册
   notifyWaitMs: 12_000,                      // 等通知真正弹出来再退出（计划任务会回收子进程）
   notifyAlready: true,                       // 今天已经签过了也弹一条，方便确认任务跑过
+  notifyHelper: true,                        // 优先交给桌面助手弹通知（计划任务自己弹不出来）
   loginTimeoutSeconds: 120,                  // 需要登录时，给你多久时间登录
   startTimeoutMs: 35_000,                    // 等待浏览器开放调试端口的上限
   pollIntervalMs: 500,                       // 轮询间隔
@@ -88,6 +89,8 @@ const CONFIG = loadConfig();
 const PROFILE_DIR = path.join(ROOT, CONFIG.profileDirName);
 const LOG_DIR = path.join(ROOT, "logs");
 const STATUS_FILE = path.join(ROOT, "status.txt");
+const HELPER_PID_FILE = path.join(LOG_DIR, "notify-helper.pid");
+const NOTIFY_QUEUE_FILE = path.join(LOG_DIR, "notify-queue.log");
 
 // 通知被点击 / 网页调用 noymanga://login 时，可能短时间内触发多次。
 // 用一个标记文件做节流，避免一下子弹出好几个登录窗口。
@@ -292,11 +295,39 @@ function runPowerShell(script, timeoutMs = 15_000) {
  * 弹一条 Windows 通知；失败只记日志，不影响签到。
  * options.action === true 时，通知可点击 → 打开登录窗口（需要协议已注册）。
  */
+/** 通知助手还活着就返回它的 pid，否则返回 0。 */
+function notifyHelperPid() {
+  try {
+    const raw = fs.readFileSync(HELPER_PID_FILE, "utf8").trim();
+    const pid = Number(raw);
+    if (!Number.isInteger(pid) || pid <= 0) return 0;
+    process.kill(pid, 0); // 只是探活，不会真的杀进程
+    return pid;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/** 把要弹的内容写进队列，交给桌面会话里的助手去弹。 */
+function queueNotification(title, message) {
+  try {
+    fs.appendFileSync(NOTIFY_QUEUE_FILE, `${title}|${message}\n`, "utf8");
+    return true;
+  } catch (error) {
+    log(`Unable to queue the notification: ${error.message}`, "WARN");
+    return false;
+  }
+}
 function notify(title, message, options = {}) {
   if (!CONFIG.notify || DRY_RUN) return;
   const wantAction = options.action === true && CONFIG.notifyAction !== false;
   const actionUrl = wantAction && isProtocolRegistered() ? loginProtocolUrl() : null;
   if (wantAction && !actionUrl) log("Notification action skipped: protocol handler not installed.", "WARN");
+  // 计划任务里的进程弹不出通知，交给桌面会话里的助手代发
+  if (CONFIG.notifyHelper !== false && notifyHelperPid() > 0 && queueNotification(title, message)) {
+    log("Notification handed to the desktop helper.");
+    return;
+  }
   const script = toastScript(title, message, 3, actionUrl);
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded];
