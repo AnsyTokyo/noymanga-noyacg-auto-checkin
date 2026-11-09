@@ -494,6 +494,26 @@ async function getBrowserWsUrl() {
   }
 }
 
+/** 按调试端口的监听者反查浏览器主进程 pid（spawn 拿到的可能是启动器壳进程）。 */
+function findPidByPort(port) {
+  try {
+    const output = execFileSync("netstat.exe", ["-ano", "-p", "tcp"], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    for (const line of output.split(/\r?\n/)) {
+      if (!line.includes(`:${port}`)) continue;
+      if (!/LISTENING/i.test(line)) continue;
+      const parts = line.trim().split(/\s+/);
+      const pid = Number(parts[parts.length - 1]);
+      if (Number.isFinite(pid) && pid > 0) return pid;
+    }
+  } catch (_) {
+    /* netstat 不可用就算了 */
+  }
+  return 0;
+}
+
 /** 按 pid 强杀整棵进程树（浏览器不响应关闭请求时的最后手段）。 */
 function killProcessTree(pid) {
   if (!pid) return false;
@@ -628,11 +648,14 @@ async function shutdownBrowser({ cdp = null, pid = 0, label = "Browser" } = {}) 
 
   if (await waitForPortClosed(5_000)) return true;
 
-  // ③ 兜底：按 pid 杀掉整棵进程树
-  if (killProcessTree(pid)) {
-    log(`${label} ignored the close request; terminated it by process id.`, "WARN");
-    return await waitForPortClosed(5_000);
+  // ③ 兜底：按「端口占用者」和「spawn 得到的 pid」强杀整棵进程树
+  const portPid = findPidByPort(CONFIG.debugPort);
+  const targets = [...new Set([portPid, pid].filter(Boolean))];
+  for (const target of targets) {
+    log(`${label} ignored the close request; terminating pid ${target}.`, "WARN");
+    killProcessTree(target);
   }
+  if (targets.length && (await waitForPortClosed(5_000))) return true;
   log(`${label} is still running after the close request.`, "WARN");
   return false;
 }
@@ -876,8 +899,11 @@ async function loginFlow() {
         await delay(1_000);
         continue;
       }
-      if (!quick.login && /noymanga\.com\/user/.test(quick.url)) {
-        log("Login detected; continuing.");
+      // 登录成功的判定：只要离开了登录页、页面上也不再显示登录入口，就算登录好了。
+      // （实测站点登录后可能跳回首页 "/" 而不是 "/user"，所以不能只认 /user。）
+      const onLoginPage = /\/login(\?|#|$)/i.test(quick.url);
+      if (!quick.login && !onLoginPage && /noymanga\.com/i.test(quick.url)) {
+        log(`Login detected on ${quick.url}; continuing.`);
         await delay(1_000);
         return true;
       }
@@ -888,7 +914,8 @@ async function loginFlow() {
     return false;
   } finally {
     // 无论成功失败都关掉，绝不留僵尸窗口（关不掉就强杀）
-    await shutdownBrowser({ cdp, pid: launched.pid || 0, label: "Login window" });
+    const closed = await shutdownBrowser({ cdp, pid: launched.pid || 0, label: "Login window" });
+    if (closed) log("Login window closed.");
     cdp.close();
   }
 }
@@ -1024,6 +1051,10 @@ async function main() {
     markLoginTriggered();
     log("Login-only mode: a browser window will open on the login page.");
     const ok = await loginFlow();
+    // 兜底：退出前再确认一次，别把窗口留在桌面上
+    if (await probeTarget()) {
+      await shutdownBrowser({ label: "Login browser" });
+    }
     if (ok) {
       log("Login saved. Future runs will reuse it.");
       writeStatus("LOGIN_OK", "login completed");
