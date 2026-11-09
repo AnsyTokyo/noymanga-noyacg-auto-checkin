@@ -9,6 +9,8 @@
  *   4. 结果用 Windows 通知提示：签到成功 / 失败 / 需要重新登录。
  *   5. 支持 config.json 覆盖默认参数，不懂代码也能改。
  *   6. 新增 --login（只登录）、--notify-test（测试通知）、--headless/--headed。
+ *   7. 「需要登录」的通知可点击：点一下直接弹出登录窗口（协议 noymanga://login）。
+ *   8. 通知里显示连续签到天数（接口返回的 continuous）。
  *
  * 不变的设计契约：
  *   - 源码里没有任何账号密码，登录态只存在于 profile 目录（默认 browser-profile/）。
@@ -21,6 +23,7 @@
  *   node noymanga-auto-checkin-v2.js --headless      # 强制无窗口
  *   node noymanga-auto-checkin-v2.js --headed        # 强制有窗口（排错用）
  *   node noymanga-auto-checkin-v2.js --notify-test   # 弹一条测试通知
+ *   node noymanga-auto-checkin-v2.js --notify-action-test  # 弹一条"可点击"的测试通知
  *
  * 退出码：0 成功（含"今天已经签过"），2 需要登录，1 其它失败。
  *
@@ -48,6 +51,8 @@ const DEFAULT_CONFIG = {
   profileDirName: "browser-profile",         // 专用浏览器配置目录（登录态存这里）
   headless: true,                            // 无窗口运行；需要登录时自动改用有窗口
   notify: true,                              // 是否弹 Windows 通知
+  notifyAction: true,                        // 需要登录的通知可点击（点了直接打开登录窗口）
+  protocolScheme: "noymanga",                // 通知点击用的自定义协议，由安装脚本注册
   loginTimeoutSeconds: 120,                  // 需要登录时，给你多久时间登录
   startTimeoutMs: 35_000,                    // 等待浏览器开放调试端口的上限
   pollIntervalMs: 500,                       // 轮询间隔
@@ -82,10 +87,16 @@ const PROFILE_DIR = path.join(ROOT, CONFIG.profileDirName);
 const LOG_DIR = path.join(ROOT, "logs");
 const STATUS_FILE = path.join(ROOT, "status.txt");
 
+// 通知被点击 / 网页调用 noymanga://login 时，可能短时间内触发多次。
+// 用一个标记文件做节流，避免一下子弹出好几个登录窗口。
+const LOGIN_TRIGGER_FILE = path.join(LOG_DIR, ".login-trigger");
+const LOGIN_TRIGGER_COOLDOWN_MS = 10_000;
+
 const ARGS = new Set(process.argv.slice(2));
 const DRY_RUN = ARGS.has("--dry-run");
 const LOGIN_ONLY = ARGS.has("--login");
 const NOTIFY_TEST = ARGS.has("--notify-test");
+const NOTIFY_ACTION_TEST = ARGS.has("--notify-action-test");
 // 命令行显式指定的模式优先于 config.json
 const FORCE_HEADLESS = ARGS.has("--headless");
 const FORCE_HEADED = ARGS.has("--headed");
@@ -178,14 +189,31 @@ function escapeXml(text) {
     .replace(/"/g, "&quot;");
 }
 
-/** 构造一段弹 Toast 的 PowerShell 脚本。 */
-function toastScript(title, message, seconds = 8) {
+/** 通知点击后交给系统的协议地址，安装脚本会把 noymanga:// 指回本脚本的 --login。 */
+function loginProtocolUrl() {
+  return `${CONFIG.protocolScheme || "noymanga"}://login`;
+}
+
+/** 协议处理器是否已经注册过（没注册就别加点击动作，免得点了没反应）。 */
+function isProtocolRegistered() {
+  const scheme = CONFIG.protocolScheme || "noymanga";
+  return regQuery(`HKCU\\Software\\Classes\\${scheme}\\shell\\open\\command`, null) !== null;
+}
+
+/**
+ * 构造一段弹 Toast 的 PowerShell 脚本。
+ * actionUrl 非空时，整条通知变成可点击：点击由系统按协议打开 actionUrl。
+ */
+function toastScript(title, message, seconds = 8, actionUrl = null) {
+  const toastAttrs = actionUrl
+    ? ` activationType="protocol" launch="${escapeXml(actionUrl)}" duration="long"`
+    : "";
   return `
 $ErrorActionPreference = 'SilentlyContinue'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] > $null
 $xml = @'
-<toast><visual><binding template="ToastGeneric"><text>${escapeXml(title)}</text><text>${escapeXml(message)}</text></binding></visual></toast>
+<toast${toastAttrs}><visual><binding template="ToastGeneric"><text>${escapeXml(title)}</text><text>${escapeXml(message)}</text></binding></visual></toast>
 '@
 $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
 $doc.LoadXml($xml)
@@ -213,11 +241,17 @@ function runPowerShell(script, timeoutMs = 15_000) {
   }
 }
 
-/** 弹一条 Windows 通知；失败只记日志，不影响签到。 */
-function notify(title, message) {
+/**
+ * 弹一条 Windows 通知；失败只记日志，不影响签到。
+ * options.action === true 时，通知可点击 → 打开登录窗口（需要协议已注册）。
+ */
+function notify(title, message, options = {}) {
   if (!CONFIG.notify || DRY_RUN) return;
+  const wantAction = options.action === true && CONFIG.notifyAction !== false;
+  const actionUrl = wantAction && isProtocolRegistered() ? loginProtocolUrl() : null;
+  if (wantAction && !actionUrl) log("Notification action skipped: protocol handler not installed.", "WARN");
   // 不等待：通知是"尽力而为"，不能拖慢或拖垮签到
-  const script = toastScript(title, message, 8);
+  const script = toastScript(title, message, 8, actionUrl);
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   try {
     const child = spawn(
@@ -228,6 +262,25 @@ function notify(title, message) {
     child.unref();
   } catch (error) {
     log(`Notification skipped: ${error.message}`, "WARN");
+  }
+}
+
+/** 通知/网页连续触发时，10 秒内只认第一次，避免弹出一堆登录窗口。 */
+function loginTriggeredTooSoon() {
+  try {
+    if (!fs.existsSync(LOGIN_TRIGGER_FILE)) return false;
+    const age = Date.now() - fs.statSync(LOGIN_TRIGGER_FILE).mtimeMs;
+    return age >= 0 && age < LOGIN_TRIGGER_COOLDOWN_MS;
+  } catch (_) {
+    return false;
+  }
+}
+
+function markLoginTriggered() {
+  try {
+    fs.writeFileSync(LOGIN_TRIGGER_FILE, String(Date.now()), "utf8");
+  } catch (_) {
+    /* 写不了就算了，节流只是锦上添花 */
   }
 }
 
@@ -824,17 +877,48 @@ async function doCheckin(cdp, state) {
   const body = String(result.body || "");
   const already = /已[签簽]到|already/i.test(body);
   const stateName = already ? "ALREADY_CHECKED_IN" : "CHECKED_IN";
+  // 接口会返回 {"continuous":N,...}：连续签到天数，顺手显示出来
+  let continuous = null;
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && Number.isFinite(Number(parsed.continuous))) continuous = Number(parsed.continuous);
+  } catch (_) {
+    /* 不是 JSON 就不显示天数 */
+  }
   log(already ? "Server says you had already checked in today." : "Check-in confirmed by the server.");
+  if (continuous !== null) log(`Continuous check-in days: ${continuous}`);
   writeStatus(stateName, already ? "already checked in today" : "check-in succeeded", {
     httpStatus: result.status,
+    ...(continuous !== null ? { continuous } : {}),
     body: body.slice(0, 200),
   });
-  if (!already) notify("Noymanga 签到成功", "今天的签到已完成。");
+  if (!already) {
+    const suffix = continuous !== null ? `已连续签到 ${continuous} 天。` : "今天的签到已完成。";
+    notify("Noymanga 签到成功", suffix);
+  }
   return stateName;
 }
 
 async function main() {
   cleanupOldLogs();
+
+  if (NOTIFY_ACTION_TEST) {
+    if (!CONFIG.notify) {
+      log("Notifications are disabled in config.json.", "WARN");
+      return 1;
+    }
+    if (!isProtocolRegistered()) {
+      log("noymanga:// is not registered yet. Run 安装.bat (or 登录.bat) once to register it.", "WARN");
+      return 1;
+    }
+    log(`Sending a clickable notification (${loginProtocolUrl()})...`);
+    const ok = runPowerShell(
+      toastScript("Noymanga 通知测试", "点击这条通知，应该会弹出登录窗口。", 15, loginProtocolUrl()),
+      25_000,
+    );
+    log(ok ? "Clickable notification sent. Now click it." : "Test notification could not be delivered.", ok ? "INFO" : "WARN");
+    return ok ? 0 : 1;
+  }
 
   if (NOTIFY_TEST) {
     log("Sending a test notification...");
@@ -861,12 +945,26 @@ async function main() {
     log(`Target URL: ${CONFIG.url}`);
     log(`Headless mode: ${headless ? "yes (no window)" : "no (visible window)"}`);
     log(`Notifications: ${CONFIG.notify ? "on" : "off"}; login timeout: ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s`);
+    log(
+      `Notification click action: ${
+        CONFIG.notifyAction === false
+          ? "off"
+          : isProtocolRegistered()
+            ? `on (${loginProtocolUrl()})`
+            : "not installed yet (run 安装.bat)"
+      }`,
+    );
     log(`Config file: ${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : "(none, using defaults)"}`);
     for (const browser of browsers) log(`  candidate: ${browser.name} => ${browser.exe}`);
     return 0;
   }
 
   if (LOGIN_ONLY) {
+    if (loginTriggeredTooSoon()) {
+      log("Another login window was opened less than 10s ago; ignoring this trigger.", "WARN");
+      return 0;
+    }
+    markLoginTriggered();
     log("Login-only mode: a browser window will open on the login page.");
     const ok = await loginFlow();
     if (ok) {
@@ -876,7 +974,9 @@ async function main() {
       return 0;
     }
     writeStatus("LOGIN_REQUIRED", "login was not completed in time");
-    notify("Noymanga 需要登录", "登录没有完成，签到暂时无法进行。请运行 登录.bat 重试。");
+    notify("Noymanga 需要登录", "登录没有完成，签到暂时无法进行。点这条通知可直接重新登录（或双击 登录.bat）。", {
+      action: true,
+    });
     return 2;
   }
 
@@ -895,13 +995,15 @@ async function main() {
   if (outcome === "LOGIN_REQUIRED") {
     log("LOGIN REQUIRED: opening a visible window on the login page.");
     writeStatus("LOGIN_REQUIRED", "manual login needed", { stage: "waiting" });
-    notify("Noymanga 需要登录", "已弹出登录窗口，请在那 2 分钟内在页面上完成登录。");
+    notify("Noymanga 需要登录", "已弹出登录窗口，请在那 2 分钟内在页面上完成登录。", { action: true });
 
     const ok = await loginFlow();
     if (!ok) {
       log("Login was not completed in time; the browser window has been closed.", "WARN");
       writeStatus("LOGIN_TIMEOUT", "login window closed after timeout");
-      notify("Noymanga 登录超时", "登录窗口已自动关闭，今天的签到没有完成。双击 登录.bat 可以重新登录。");
+      notify("Noymanga 登录超时", "登录窗口已自动关闭，今天的签到没有完成。点这条通知可重新登录。", {
+        action: true,
+      });
       return 2;
     }
 
@@ -913,7 +1015,9 @@ async function main() {
       if (finalState.login) {
         log("Still seeing the login indicator after login; giving up for today.", "WARN");
         writeStatus("LOGIN_REQUIRED", "still logged out after login flow");
-        notify("Noymanga 需要登录", "登录后仍然未登录，请手动运行 登录.bat 检查。");
+        notify("Noymanga 需要登录", "登录后仍然未登录，点这条通知可重试，或双击 登录.bat 检查。", {
+          action: true,
+        });
         finalState = null;
         return;
       }

@@ -7,6 +7,8 @@ Chromium 内核浏览器）打开一份**独立的浏览器配置目录**保存�
 - **双击就能装**：`安装.bat` 是个向导，问你要几点签到，然后自动创建计划任务
 - **平时无窗口**：日常运行时浏览器在后台无窗口执行，不会在午夜弹窗
 - **需要登录时会给你窗口**：登录态失效时自动弹出登录页，给你 2 分钟；超时自动关窗、发通知、退出，不留僵尸窗口
+- **点通知就能登录**：收到"需要登录"的通知，点一下它就直接弹出登录窗口
+- **通知里显示连续签到天数**：签到成功会告诉你"已连续签到 N 天"
 - 不保存账号密码，登录状态只存在本地 `browser-profile/` 里
 - 不读取、不修改你日常使用的浏览器个人资料
 - 源码里没有任何账号、Cookie、令牌
@@ -25,14 +27,15 @@ Chromium 内核浏览器）打开一份**独立的浏览器配置目录**保存�
 
 装完就没事了。之后每天到点自动签到；想提前确认，可以双击 `查看状态.bat`。
 
-## 四个双击即用的入口
+## 五个双击即用的入口
 
 | 文件 | 作用 |
 | --- | --- |
 | `安装.bat` | 安装向导：选时间、开机补签、首次登录（也可以用来**改时间**：重新跑一遍即可覆盖旧任务） |
 | `查看状态.bat` | 看计划任务、上次运行时间、最近一次结果、最新日志 |
 | `登录.bat` | 重新登录一次（登录态过期时用，会直接打开登录页） |
-| `卸载.bat` | 删除计划任务（脚本、登录态、日志都保留，想彻底删就删整个文件夹） |
+| `卸载.bat` | 删除计划任务和通知点击协议（脚本、登录态、日志都保留，想彻底删就删整个文件夹） |
+| `打包.bat` | 把当前版本打成一个 zip（用于发 GitHub Releases） |
 
 命令行用法（不想用向导时）：
 
@@ -58,7 +61,7 @@ powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Uninstall
 | --- | --- |
 | `noymanga-auto-checkin-v2.js` | **主脚本**（Node.js）：识别默认浏览器、驱动它签到、写日志和状态 |
 | `install-daily-task-v2.ps1` | 安装/管理引擎：生成计划任务 XML、交互式向导、状态查看、登录、卸载 |
-| `安装.bat` / `查看状态.bat` / `登录.bat` / `卸载.bat` | 上面的四个快捷入口（本质都是调用 `install-daily-task-v2.ps1`） |
+| `安装.bat` / `查看状态.bat` / `登录.bat` / `卸载.bat` / `打包.bat` | 上面的五个快捷入口（前四个调用 `install-daily-task-v2.ps1`，`打包.bat` 用 `git archive` 生成 zip） |
 | `config.example.json` | 可选的配置文件模板（复制成 `config.json` 后生效） |
 | `noymanga-auto-checkin.js` | 旧版脚本（v1，写死 Chrome 路径，保留给老用户） |
 | `install-daily-task.ps1` | 旧版安装脚本（v1 用） |
@@ -89,16 +92,28 @@ powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Uninstall
 
 | state | 含义 | 会发生什么 |
 | --- | --- | --- |
-| `CHECKED_IN` | 签到成功 | 弹通知"签到成功" |
+| `CHECKED_IN` | 签到成功（`status.txt` 里带 `continuous` 连续天数） | 弹通知"已连续签到 N 天" |
 | `ALREADY_CHECKED_IN` | 今天已经签过了 | 安静退出，不打扰 |
-| `LOGIN_REQUIRED` | 需要重新登录 | 弹登录窗口 + 通知 |
-| `LOGIN_TIMEOUT` | 登录窗口 2 分钟没人操作 | 关窗 + 通知"登录超时"，双击 `登录.bat` 可重来 |
+| `LOGIN_REQUIRED` | 需要重新登录 | 弹登录窗口 + **可点击**的通知 |
+| `LOGIN_TIMEOUT` | 登录窗口 2 分钟没人操作 | 关窗 + 可点击的通知"登录超时" |
 | `CHECKIN_FAILED` | 服务器拒绝（输出了 HTTP 状态码） | 通知"签到失败" |
 | `NO_BUTTON` | 页面上找不到签到按钮（站点可能改版） | 通知"签到失败" |
 | `ERROR` | 脚本运行出错（网络、浏览器等） | 通知错误摘要 |
 
 通知用的是 Windows 自带的 Toast，不需要装任何东西。如果没看到通知，检查
 **设置 → 系统 → 通知** 里是否允许了 PowerShell / Windows PowerShell 的通知。
+
+**关于"点通知直接登录"**：安装时会在 `HKCU\Software\Classes\noymanga` 注册一个 `noymanga://login`
+协议（普通用户权限即可，不需要管理员），并把它指向本目录的脚本。所以「需要登录 / 登录超时」的通知可以点击，
+点一下就直接弹出登录窗口，不用再去文件夹里找 `登录.bat`。卸载时会自动删掉这个注册表项。
+不想用这个功能可以把 `config.json` 里的 `notifyAction` 设为 `false`。
+
+验证它是否生效：
+
+```powershell
+node .\noymanga-auto-checkin-v2.js --dry-run              # 看 "Notification click action" 是不是 on
+node .\noymanga-auto-checkin-v2.js --notify-action-test   # 弹一条可点击的通知，点一下试试
+```
 
 ## 可选配置 `config.json`
 
@@ -116,6 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Uninstall
 | --- | --- | --- |
 | `headless` | `true` | `false` 则每次都有可见窗口（排错时用） |
 | `notify` | `true` | `false` 关掉所有 Windows 通知 |
+| `notifyAction` | `true` | `false` 则通知不可点击（就不用注册 noymanga:// 协议） |
 | `loginTimeoutSeconds` | `120` | 需要登录时给多少秒 |
 | `debugPort` | `19346` | 浏览器调试端口，被占用时改它 |
 
@@ -160,6 +176,14 @@ A：在 PowerShell 里 `cd` 到本目录再执行 `.\安装.bat`，就能看到�
 
 **Q：公司电脑不让建计划任务？**
 A：需要管理员权限或组策略允许。可以右键 `安装.bat` →「以管理员身份运行」再试。
+
+**Q：点了"需要登录"的通知，没反应？**
+A：说明 `noymanga://login` 还没注册（例如任务是从旧版升级来的）。重新运行一次 `安装.bat`（或 `登录.bat`）即可注册；
+`node .\noymanga-auto-checkin-v2.js --dry-run` 里的 `Notification click action` 会显示是否已就绪。
+
+**Q：想发到 GitHub Releases，怎么打包？**
+A：双击 `打包.bat`，会在本地生成 `noymanga-auto-checkin.zip`（只含仓库文件，不含登录态和日志）。把这个 zip 拖到
+Releases 里即可。
 
 ## 工作原理（给好奇的人）
 

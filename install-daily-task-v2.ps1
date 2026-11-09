@@ -199,6 +199,29 @@ function Show-Status {
     Write-Host ("  日志目录：{0}" -f $logDir)
 }
 
+# ---------------------------------------------------------------
+# 自定义协议：noymanga://login → 本脚本的 --login
+# 作用：签到失败/需要登录时，点一下 Windows 通知就能打开登录窗口。
+# 只写 HKCU，不需要管理员权限；卸载时会删掉。
+# ---------------------------------------------------------------
+$protocolScheme = 'noymanga'
+
+function Register-LoginProtocol([string]$nodePath, [string]$targetScript) {
+    $root = "HKCU:\Software\Classes\$protocolScheme"
+    $commandKey = Join-Path $root 'shell\open\command'
+    $command = '"{0}" "{1}" --login' -f $nodePath, $targetScript
+    New-Item -Path $root -Force | Out-Null
+    Set-ItemProperty -Path $root -Name '(default)' -Value 'URL:Noymanga Auto Check-in Login'
+    New-ItemProperty -Path $root -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
+    New-Item -Path $commandKey -Force | Out-Null
+    Set-ItemProperty -Path $commandKey -Name '(default)' -Value $command
+    return $command
+}
+
+function Unregister-LoginProtocol {
+    Remove-Item -Path "HKCU:\Software\Classes\$protocolScheme" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Invoke-Login([string]$nodePath) {
     Write-Head '登录 Noymanga'
     Write-Host '  即将打开一个浏览器窗口。请在里面完成登录（含验证码），登录后窗口会自动关闭。'
@@ -229,6 +252,8 @@ if ($Uninstall) {
     } else {
         Write-Host '  计划任务本来就不存在。' -ForegroundColor Yellow
     }
+    Unregister-LoginProtocol
+    Write-Host '  通知点击用的 noymanga:// 协议已移除。' -ForegroundColor Green
     Write-Host ''
     Write-Host '  登录态、日志、脚本文件都还在，需要的话可以手动删除整个文件夹。'
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
@@ -248,6 +273,7 @@ $node = Find-Node
 
 if ($Login) {
     if (-not $node) { Write-Host '  找不到 Node.js，请先安装。' -ForegroundColor Red; return }
+    Register-LoginProtocol $node $scriptPath | Out-Null
     Invoke-Login $node | Out-Null
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
     return
@@ -320,6 +346,8 @@ if ($DryRun) {
     Write-Host ''
     Write-Host '  -DryRun：只打印任务定义，不真正创建。' -ForegroundColor Yellow
     Write-Host $xml
+    Write-Host ''
+    Write-Host ('  通知点击：{0}://login → "{1}" "{2}" --login' -f $protocolScheme, $node, $scriptPath) -ForegroundColor Yellow
     return
 }
 
@@ -347,6 +375,14 @@ Write-Host '  计划任务创建成功。' -ForegroundColor Green
 Write-Host ("    任务名称：{0}" -f $taskName)
 Write-Host ("    运行命令：`"{0}`" `"{1}`"" -f $node, $scriptPath)
 Write-Host ("    运行时间：每天 {0}" -f $startTime)
+
+# 3.5) 注册通知点击协议（点通知 → 打开登录窗口）
+try {
+    $protocolCommand = Register-LoginProtocol $node $scriptPath
+    Write-Host ("    通知点击：{0}://login → {1}" -f $protocolScheme, $protocolCommand)
+} catch {
+    Write-Host ("    通知点击协议注册失败（不影响签到）：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}
 
 # 4) 是否现在登录
 Write-Host ''
