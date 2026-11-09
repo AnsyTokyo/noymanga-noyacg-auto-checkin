@@ -27,13 +27,14 @@ Chromium 内核浏览器）打开一份**独立的浏览器配置目录**保存�
 
 装完就没事了。之后每天到点自动签到；想提前确认，可以双击 `查看状态.bat`。
 
-## 五个双击即用的入口
+## 六个双击即用的入口
 
 | 文件 | 作用 |
 | --- | --- |
 | `安装.bat` | 安装向导：选时间、开机补签、首次登录（也可以用来**改时间**：重新跑一遍即可覆盖旧任务） |
 | `查看状态.bat` | 看计划任务、上次运行时间、最近一次结果、最新日志 |
 | `登录.bat` | 重新登录一次（登录态过期时用，会直接打开登录页） |
+| `取消自动签到.bat` | **只删计划任务**，脚本、登录态、日志全部保留；想恢复就再双击 `安装.bat` |
 | `卸载.bat` | 删除计划任务和通知点击协议（脚本、登录态、日志都保留，想彻底删就删整个文件夹） |
 | `打包.bat` | 把当前版本打成一个 zip（用于发 GitHub Releases） |
 
@@ -49,9 +50,10 @@ powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Time 08:30
 # 只看计划任务定义，不真正创建
 powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Time 08:30 -DryRun
 
-# 查看状态 / 重新登录 / 卸载
+# 查看状态 / 重新登录 / 仅取消自动签到 / 完全卸载
 powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Status
 powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Login
+powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -RemoveTask
 powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Uninstall
 ```
 
@@ -61,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File .\install-daily-task-v2.ps1 -Uninstall
 | --- | --- |
 | `noymanga-auto-checkin-v2.js` | **主脚本**（Node.js）：识别默认浏览器、驱动它签到、写日志和状态 |
 | `install-daily-task-v2.ps1` | 安装/管理引擎：生成计划任务 XML、交互式向导、状态查看、登录、卸载 |
-| `安装.bat` / `查看状态.bat` / `登录.bat` / `卸载.bat` / `打包.bat` | 上面的五个快捷入口（前四个调用 `install-daily-task-v2.ps1`，`打包.bat` 用 `git archive` 生成 zip） |
+| `安装.bat` / `查看状态.bat` / `登录.bat` / `取消自动签到.bat` / `卸载.bat` / `打包.bat` | 上面的六个快捷入口（前五个调用 `install-daily-task-v2.ps1`，`打包.bat` 用 `git archive` 生成 zip） |
 | `config.example.json` | 可选的配置文件模板（复制成 `config.json` 后生效） |
 | `noymanga-auto-checkin.js` | 旧版脚本（v1，写死 Chrome 路径，保留给老用户） |
 | `install-daily-task.ps1` | 旧版安装脚本（v1 用） |

@@ -1,24 +1,22 @@
-﻿# .SYNOPSIS
-# Noymanga 每日自动签到：安装 / 修改 / 查看 / 卸载。
+﻿#
+# Noymanga 每日自动签到 —— 安装 / 修改 / 登录 / 查看 / 取消 / 卸载
 #
-# .DESCRIPTION
-# 双击「安装.bat」即可进入交互式安装向导：选择签到时间、是否开机补签、
-# 是否现在就登录一次。装完会在 Windows 任务计划程序里创建
-# 「Noymanga Daily Check-in」每天定时运行。
+# 用法（双击 bat 更省事）：
+#   .\install-daily-task-v2.ps1                   交互式安装向导
+#   .\install-daily-task-v2.ps1 -Time 08:30       指定签到时间
+#   .\install-daily-task-v2.ps1 -Time 07:15 -NoCatchUp
+#   .\install-daily-task-v2.ps1 -Status           查看上次结果
+#   .\install-daily-task-v2.ps1 -Login            重新登录
+#   .\install-daily-task-v2.ps1 -RemoveTask       取消自动签到（保留脚本和登录态）
+#   .\install-daily-task-v2.ps1 -Uninstall        卸载（删任务 + 删通知协议）
 #
-# .EXAMPLE
-# .\install-daily-task-v2.ps1                  # 交互式向导
-# .\install-daily-task-v2.ps1 -Time 08:30      # 直接指定签到时间
-# .\install-daily-task-v2.ps1 -Time 07:15 -NoCatchUp
-# .\install-daily-task-v2.ps1 -Status          # 查看最近一次结果
-# .\install-daily-task-v2.ps1 -Login           # 只是重新登录
-# .\install-daily-task-v2.ps1 -Uninstall       # 删除计划任务
 [CmdletBinding()]
 param(
     [string]$Time,
     [switch]$NoCatchUp,
     [switch]$Status,
     [switch]$Uninstall,
+    [switch]$RemoveTask,
     [switch]$Login,
     [switch]$Quiet,
     [switch]$DryRun
@@ -237,6 +235,35 @@ function Invoke-Login([string]$nodePath) {
         Write-Host "  登录流程出错（退出码 $code），请查看 logs 目录。" -ForegroundColor Red
     }
     return $code
+}
+
+# ---------------------------------------------------------------
+# 只取消自动签到（删任务，保留脚本 / 登录态 / 日志）
+# ---------------------------------------------------------------
+if ($RemoveTask) {
+    Write-Head '取消每日自动签到'
+    Write-Host '  将删除计划任务「Noymanga Daily Check-in」。'
+    Write-Host '  脚本文件、登录态（browser-profile）和日志都会保留。'
+    Write-Host ''
+    if (-not $Quiet) {
+        $answer = Read-Host '  确认取消自动签到吗？输入 y 确认，直接回车退出 [y/N]'
+        if (($answer -as [string]).Trim().ToLower() -notin @('y', 'yes')) {
+            Write-Host '  已取消，什么都没改。' -ForegroundColor Yellow
+            Read-Host '  按回车键关闭' | Out-Null
+            return
+        }
+    }
+    $removed = Invoke-Schtasks @('/Delete', '/TN', $taskName, '/F')
+    if ($removed.Code -eq 0) {
+        Write-Host '  计划任务已删除，以后不会再自动签到了。' -ForegroundColor Green
+    } else {
+        Write-Host '  计划任务本来就不存在（可能之前已经取消过）。' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host '  想恢复自动签到：双击「安装.bat」，按提示重来一遍即可（登录态还在，不用重新登录）。'
+    Write-Host '  想手动立刻签一次：node .\noymanga-auto-checkin-v2.js'
+    if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
+    return
 }
 
 # ---------------------------------------------------------------
