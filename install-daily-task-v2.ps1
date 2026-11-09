@@ -19,7 +19,8 @@ param(
     [switch]$RemoveTask,
     [switch]$Login,
     [switch]$Quiet,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$ElevatedOk
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,46 @@ $statusFile = Join-Path $scriptDir 'status.txt'
 $logDir = Join-Path $scriptDir 'logs'
 $taskName = 'Noymanga Daily Check-in'
 
+# ---------------------------------------------------------------
+# 管理员权限：安装 / 取消签到 / 卸载 需要写计划任务，Windows 会要求提权。
+# 这里自动判断并弹一次 UAC，所以「双击 → 点『是』」就够了，不用右键。
+# ---------------------------------------------------------------
+function Test-IsElevated {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+$needsAdmin = $RemoveTask -or $Uninstall -or (-not ($Status -or $Login -or $DryRun))
+if ($needsAdmin -and -not $ElevatedOk -and -not (Test-IsElevated)) {
+    $forward = @()
+    if ($Time) { $forward += @('-Time', $Time) }
+    if ($NoCatchUp) { $forward += '-NoCatchUp' }
+    if ($RemoveTask) { $forward += '-RemoveTask' }
+    if ($Uninstall) { $forward += '-Uninstall' }
+    if ($Quiet) { $forward += '-Quiet' }
+    $argumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-ElevatedOk') + $forward
+
+    Write-Host ''
+    Write-Host '  正在请求管理员权限……' -ForegroundColor Yellow
+    Write-Host '  如果弹出「你要允许此应用对你的设备进行更改吗？」，点「是」即可。' -ForegroundColor DarkGray
+    Write-Host '  同意后，接下来的操作会在新窗口里继续进行。' -ForegroundColor DarkGray
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentList -Verb RunAs | Out-Null
+        Start-Sleep -Milliseconds 600
+    } catch {
+        Write-Host ''
+        Write-Host '  提权被取消（或者系统不允许），安装没有完成。' -ForegroundColor Red
+        Write-Host ('  详情：' + $_.Exception.Message)
+        if (-not $Quiet) { Read-Host ' 按回车键关闭' | Out-Null }
+        exit 1
+    }
+    exit 0
+}
 function Write-Head($text) {
     Write-Host ''
     Write-Host ('=' * 60) -ForegroundColor DarkCyan
@@ -308,7 +349,7 @@ if ($Login) {
 # 安装 / 修改
 # ---------------------------------------------------------------
 Write-Head 'Noymanga 每日自动签到 · 安装向导'
-Write-Host '  提示：本程序不需要管理员权限，直接双击运行即可。' -ForegroundColor DarkGray
+Write-Host '  提示：直接双击即可；创建计划任务时会自动弹出一次 UAC，点「是」。' -ForegroundColor DarkGray
 Write-Host '        （创建的是「只在你登录时运行」的个人任务，写的是你自己的注册表项。）' -ForegroundColor DarkGray
 
 if (-not (Test-Path -LiteralPath $scriptPath)) {
@@ -393,7 +434,8 @@ if ($createCode -ne 0) {
     Write-Host '  创建计划任务失败：' -ForegroundColor Red
     $result | ForEach-Object { Write-Host "    $_" }
     Write-Host ''
-    Write-Host '  常见原因：当前账户不允许创建任务。请右键「安装.bat」→ 以管理员身份运行，再试一次。' -ForegroundColor Yellow
+    Write-Host '  常见原因：这台电脑的策略不允许普通权限创建计划任务。' -ForegroundColor Yellow
+    Write-Host '  解决办法：右键「安装.bat」→ 以管理员身份运行。' -ForegroundColor Yellow
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
     exit 1
 }
