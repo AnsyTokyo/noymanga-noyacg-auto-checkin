@@ -35,6 +35,129 @@ $statusFile = Join-Path $scriptDir 'status.txt'
 $logDir = Join-Path $scriptDir 'logs'
 $taskName = 'Noymanga Daily Check-in'
 
+$toastAppId = 'Noymanga.AutoCheckin'
+$windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+# ---------------------------------------------------------------
+# 通知身份（AppUserModelID）
+# 计划任务里借 PowerShell 的身份发通知会报 0x80073D54「该进程没有程序包标识符」，
+# 通知被静默丢弃。给本程序注册一个自己的 AUMID（开始菜单快捷方式 + 注册表显示名），
+# 通知就能正常出现在右下角。
+# ---------------------------------------------------------------
+$toastIdentitySource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class ToastIdentity
+{
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    private class ShellLink { }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+    private interface IShellLinkW
+    {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cch, IntPtr pfd, uint fFlags);
+        void GetIDList(out IntPtr ppidl);
+        void SetIDList(IntPtr pidl);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cch);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cch);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cch);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
+        void GetHotkey(out short pwHotkey);
+        void SetHotkey(short wHotkey);
+        void GetShowCmd(out int piShowCmd);
+        void SetShowCmd(int iShowCmd);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszIconPath, int cch, out int piIcon);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, uint dwReserved);
+        void Resolve(IntPtr hwnd, uint fFlags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
+    }
+
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPersistFile
+    {
+        void GetClassID(out Guid pClassID);
+        [PreserveSig] int IsDirty();
+        void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
+        void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, [MarshalAs(UnmanagedType.Bool)] bool fRemember);
+        void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
+        void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore
+    {
+        void GetCount(out uint cProps);
+        void GetAt(uint iProp, out PROPERTYKEY pkey);
+        void GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+        void SetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
+        void Commit();
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct PROPVARIANT
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr pointerValue;
+    }
+
+    public static void Create(string shortcutPath, string targetPath, string arguments, string workingDirectory, string appId)
+    {
+        var link = new ShellLink();
+        var shellLink = (IShellLinkW)link;
+        shellLink.SetPath(targetPath);
+        shellLink.SetArguments(arguments);
+        shellLink.SetWorkingDirectory(workingDirectory);
+        shellLink.SetDescription("Noymanga 每日自动签到");
+
+        var key = new PROPERTYKEY();
+        key.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+        key.pid = 5;
+
+        var pv = new PROPVARIANT();
+        pv.vt = 31; // VT_LPWSTR
+        pv.pointerValue = Marshal.StringToCoTaskMemUni(appId);
+
+        var store = (IPropertyStore)link;
+        store.SetValue(ref key, ref pv);
+        store.Commit();
+
+        ((IPersistFile)link).Save(shortcutPath, true);
+    }
+}
+'@
+
+function Register-ToastIdentity {
+    param([string]$AppId = $script:toastAppId)
+
+    if (-not ('ToastIdentity' -as [type])) {
+        Add-Type -TypeDefinition $script:toastIdentitySource -Language CSharp
+    }
+
+    $appKey = "HKCU:\Software\Classes\AppUserModelId\$AppId"
+    if (-not (Test-Path -Path $appKey)) { New-Item -Path $appKey -Force | Out-Null }
+    New-ItemProperty -Path $appKey -Name 'DisplayName' -Value 'Noymanga 自动签到' -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $appKey -Name 'IconUri' -Value $script:windowsPowerShell -PropertyType String -Force | Out-Null
+
+    $lnkPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Noymanga 自动签到.lnk'
+    [ToastIdentity]::Create($lnkPath, $script:windowsPowerShell, '-NoProfile', (Split-Path -Parent $script:windowsPowerShell), $AppId)
+    return $lnkPath
+}
+
+function Unregister-ToastIdentity {
+    param([string]$AppId = $script:toastAppId)
+    $lnkPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Noymanga 自动签到.lnk'
+    Remove-Item -LiteralPath $lnkPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "HKCU:\Software\Classes\AppUserModelId\$AppId" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # 需要管理员权限的操作：安装 / 改时间 / 卸载。没权限时自动弹一次 UAC 提权，双击即可。
 function Test-IsElevated {
     try {
@@ -289,6 +412,8 @@ if ($Uninstall) {
     }
     Unregister-LoginProtocol
     Write-Host '  通知点击用的 noymanga:// 协议已移除。' -ForegroundColor Green
+    Unregister-ToastIdentity
+    Write-Host '  通知身份（开始菜单快捷方式）已移除。' -ForegroundColor Green
     Write-Host ''
     Write-Host '  登录态、日志、脚本文件都还在，需要的话可以手动删除整个文件夹。'
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
@@ -309,6 +434,7 @@ $node = Find-Node
 if ($Login) {
     if (-not $node) { Write-Host '  找不到 Node.js，请先安装。' -ForegroundColor Red; return }
     Register-LoginProtocol $node $scriptPath | Out-Null
+    try { Register-ToastIdentity | Out-Null } catch { }
     Invoke-Login $node | Out-Null
     if (-not $Quiet) { Read-Host '  按回车键关闭' | Out-Null }
     return
@@ -417,6 +543,15 @@ try {
     Write-Host ("    通知点击：{0}://login → {1}" -f $protocolScheme, $protocolCommand)
 } catch {
     Write-Host ("    通知点击协议注册失败（不影响签到）：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}
+
+# 3.6) 注册通知身份（AppUserModelID）
+# 没有这一步，Windows 会静默丢弃通知：Show() 不报错，但屏幕上什么都没有。
+try {
+    $toastLnk = Register-ToastIdentity
+    Write-Host ("    通知身份：{0} → {1}" -f $toastAppId, $toastLnk)
+} catch {
+    Write-Host ("    通知身份注册失败（通知可能不显示）：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
 }
 
 # 4) 是否现在登录

@@ -274,8 +274,8 @@ function notify(title, message, options = {}) {
       return;
     }
     lastError = result.message;
-    if (/0x80073D54|no package identity/i.test(lastError) && appId === TOAST_APP_ID) {
-      log("Own app identity is not registered yet; falling back to PowerShell's.", "WARN");
+    if (appId === TOAST_APP_ID) {
+      log(`Own app identity did not accept the notification (${lastError}); falling back to PowerShell's.`, "WARN");
       continue;
     }
     break;
@@ -295,11 +295,13 @@ function showToast(appId, title, message, actionUrl) {
       { encoding: "utf8", timeout: CONFIG.notifyWaitMs, stdio: ["ignore", "pipe", "ignore"] },
     );
     const text = String(out || "").trim();
+    if (text.includes("TOAST OK")) return { ok: true, message: "" };
     const at = text.indexOf("TOAST ERR");
     if (at !== -1) return { ok: false, message: text.slice(at + "TOAST ERR".length).trim() };
-    return { ok: true, message: "" };
+    return { ok: false, message: text || "PowerShell returned no confirmation." };
   } catch (error) {
     const partial = String((error && error.stdout) || "").trim();
+    if (partial.includes("TOAST OK")) return { ok: true, message: "" };
     const at = partial.indexOf("TOAST ERR");
     if (at !== -1) return { ok: false, message: partial.slice(at + "TOAST ERR".length).trim() };
     return { ok: false, message: String((error && error.message) || error) };
